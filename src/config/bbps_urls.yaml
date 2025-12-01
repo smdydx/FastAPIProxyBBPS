@@ -62,6 +62,27 @@ bbps_backend_urls:
     ifsc_list: "/banks/{bank_id}/ifsc"
     search_ifsc: "/banks/ifsc/search"
 
+  admin:
+    base_url: "https://your-actual-lcrpay-backend.com/api/v1"
+    upload_excel: "/admin/upload/excel"
+    stats: "/admin/stats"
+    categories: "/admin/categories"
+    sync_billers: "/admin/sync/billers"
+
+  auth:
+    base_url: "https://your-actual-lcrpay-backend.com/api/v1"
+    register: "/auth/register"
+    login: "/auth/login"
+    refresh: "/auth/refresh"
+    me: "/auth/me"
+
+  biller_management:
+    base_url: "https://your-actual-lcrpay-backend.com/api/v1"
+    upload_csv: "/biller-management/upload/csv"
+    bulk_insert: "/biller-management/bulk/insert"
+    bulk_update: "/biller-management/bulk/update"
+    bulk_delete: "/biller-management/bulk/delete"
+
 api_settings:
   timeout: 30
   max_retries: 3

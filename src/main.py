@@ -15,6 +15,9 @@ from src.routes.billpayment import router as billpayment_router
 from src.routes.billers import router as billers_router
 from src.routes.complaints import router as complaints_router
 from src.routes.banks import router as banks_router
+from src.routes.admin_router import router as admin_router
+from src.routes.auth_router import router as auth_router
+from src.routes.biller_management import router as biller_management_router
 
 app = FastAPI(
     title=settings.APP_NAME,
@@ -98,6 +101,9 @@ app.include_router(billpayment_router, prefix="/api/v1")
 app.include_router(billers_router, prefix="/api/v1")
 app.include_router(complaints_router, prefix="/api/v1")
 app.include_router(banks_router, prefix="/api/v1")
+app.include_router(admin_router, prefix="/api/v1")
+app.include_router(auth_router, prefix="/api/v1")
+app.include_router(biller_management_router, prefix="/api/v1")
 
 
 @app.get("/")
@@ -115,7 +121,10 @@ async def root():
             "billfetch": "/api/v1/billfetch",
             "billpayment": "/api/v1/billpayment",
             "complaints": "/api/v1/complaints",
-            "banks": "/api/v1/banks"
+            "banks": "/api/v1/banks",
+            "admin": "/api/v1/admin",
+            "auth": "/api/v1/auth",
+            "biller_management": "/api/v1/biller-management"
         },
         "timestamp": datetime.utcnow().isoformat()
     })
