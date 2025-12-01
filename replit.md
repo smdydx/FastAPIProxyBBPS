@@ -2,9 +2,9 @@
 
 ## Overview
 
-A production-ready FastAPI proxy server for Bharat Bill Payment System (BBPS) operations. This system acts as an intermediary between client applications and BBPS backend services, providing a centralized point for request handling, authentication, caching, and monitoring. The proxy architecture enables hiding real backend URLs, implementing security layers, and adding comprehensive logging and monitoring capabilities.
+A production-ready FastAPI proxy server that acts as an intermediary between client applications and Bharat Bill Payment System (BBPS) backend services. The system provides centralized request routing, OAuth2 authentication, PostgreSQL database operations, Redis caching, and comprehensive API management for all BBPS operations including bill payments, complaints, biller management, and MDM (Master Data Management).
 
-**Core Purpose**: Forward client requests to BBPS backend services while providing OAuth2 authentication, Redis caching, PostgreSQL database operations, and complete request/response lifecycle management.
+**Core Purpose**: Securely forward client requests to BBPS backend endpoints while hiding backend URLs, providing authentication, caching, logging, and database persistence.
 
 ## User Preferences
 
@@ -12,11 +12,11 @@ Preferred communication style: Simple, everyday language.
 
 ## System Architecture
 
-### 1. Request Flow Architecture
+### 1. Proxy-Based Request Routing
 
-**Problem**: Need to securely route client requests to multiple BBPS backend endpoints without exposing backend URLs.
+**Problem**: Need to route client requests to multiple BBPS backend endpoints without exposing backend URLs, while providing centralized monitoring and control.
 
-**Solution**: Implemented a proxy-based architecture where all client requests flow through a centralized FastAPI server that forwards requests to configured backend URLs.
+**Solution**: Implemented a proxy architecture where all client requests flow through a FastAPI server that reads backend URLs from YAML configuration and forwards requests with retry logic.
 
 **Flow Pattern**:
 ```
@@ -24,262 +24,215 @@ Client → FastAPI Proxy (Port 5000) → BBPS Backend Services
 ```
 
 **Key Components**:
-- **ProxyForwarder** (`app/services/proxy.py`): Reusable service that reads YAML configuration, constructs target URLs, and forwards requests with retry logic
-- **Category-based routing**: Requests are organized by BBPS categories (MDM, bill fetch, bill payment, complaints, banks, billers)
-- **Dynamic URL construction**: URLs built from YAML config with support for path parameters, query parameters, and custom headers
+- **ProxyForwarder** (`app/services/proxy.py`): Reusable service that constructs target URLs from YAML config, forwards HTTP requests with configurable timeout and retry logic
+- **Category-based routing**: Requests organized by BBPS categories (MDM, bill fetch, bill payment, complaints, banks, billers, monitoring)
+- **Dynamic URL construction**: Supports path parameters, query parameters, and custom headers
+- **Request/Response normalization**: Standardized response format via `BBPSResponse` schema
 
-**Rationale**: This approach centralizes all BBPS communication, making it easier to update backend URLs, add monitoring, and implement security controls without changing client code.
+**Rationale**: Centralizes all BBPS communication, making it easy to update backend URLs, add monitoring, and implement security controls without changing client code.
+
+**Pros**: Single point of control, easy configuration updates, consistent logging
+**Cons**: Additional network hop adds latency, proxy becomes single point of failure
 
 ### 2. Authentication & Authorization
 
-**Problem**: Need to secure API access and track which clients are making requests.
+**Problem**: Need to secure API access, track which clients are making requests, and provide different permission levels.
 
-**Solution**: OAuth2 + JWT token-based authentication with scope-based authorization.
+**Solution**: OAuth2 + JWT token-based authentication with scope-based authorization and optional API key authentication.
 
 **Implementation**:
-- **OAuth2 password flow** for token generation (`app/core/auth.py`)
-- **JWT tokens** with configurable expiration (access tokens: 30 min, refresh tokens: 7 days)
+- **OAuth2 password flow** for token generation (`/api/v1/auth/token`)
+- **JWT tokens** with configurable expiration (access: 30 min, refresh: 7 days)
 - **Scope-based permissions** for admin vs regular client access
 - **API Key authentication** as alternative to OAuth2 tokens
 - **Password hashing** using bcrypt via passlib
+- **Token refresh** mechanism for long-lived sessions
 
-**Alternatives Considered**: Simple API key authentication was considered but OAuth2 provides better token lifecycle management and scope control.
+**Key Files**:
+- `app/core/auth.py`: JWT creation, verification, OAuth2 scheme
+- `app/core/security.py`: Password hashing, API key generation, signature verification
+- `app/api/v1/endpoints/auth.py`: Login, token refresh, password change endpoints
+
+**Alternatives Considered**: Simple API key authentication was considered but OAuth2 provides better token lifecycle management.
 
 **Pros**: Standard OAuth2 flow, token refresh capability, fine-grained access control
 **Cons**: More complex than simple API keys, requires token management on client side
 
-### 3. Data Persistence Layer
+### 3. Database Architecture
 
-**Problem**: Need to store client information, transactions, billers, and audit logs.
+**Problem**: Need to persist client data, transactions, billers, complaints, and audit logs while supporting async operations.
 
-**Solution**: Async PostgreSQL with SQLAlchemy ORM and connection pooling.
+**Solution**: Async PostgreSQL with SQLAlchemy ORM using asyncpg driver.
 
-**Architecture**:
-- **Async SQLAlchemy** (`sqlalchemy.ext.asyncio`) for non-blocking database operations
-- **Connection pooling** (pool_size: 10, max_overflow: 20) for efficient resource usage
-- **Asyncpg driver** for high-performance PostgreSQL async operations
-- **Automatic connection cleanup** via lifespan context manager
+**Implementation**:
+- **Async SQLAlchemy engine** with connection pooling
+- **Session management** via dependency injection (`get_db`)
+- **ORM models** for all entities (Client, Biller, Transaction, Complaint, etc.)
+- **Connection pool** with configurable size, max overflow, and timeout
+- **Database initialization** during application startup via lifespan context manager
 
-**Database Models** (`app/models/optimized_models.py`):
-- **Client**: OAuth2 clients with credentials and scopes
-- **Biller/BillerMDM**: Master data for BBPS billers
-- **Transaction**: Payment transaction records
+**Key Models** (`app/models/optimized_models.py`):
+- **Client**: API clients with credentials and scopes
+- **Biller**: Biller master data with MDM information
+- **Transaction**: Bill payment transactions with status tracking
 - **BillFetchRecord**: Bill fetch history
-- **Complaint**: Complaint tracking
-- **AuditLog**: Activity logging
+- **Complaint**: Complaint registration and tracking
+- **AuditLog**: System activity logging
 - **APIKey**: API key management
 
-**Design Decision**: Used async operations throughout to prevent blocking I/O during database queries, enabling the server to handle concurrent requests efficiently.
+**Database URL**: Supports PostgreSQL with automatic conversion to asyncpg driver (`postgresql+asyncpg://`)
 
-### 4. Caching Strategy
+**Rationale**: Async operations prevent blocking during database I/O, connection pooling optimizes resource usage.
 
-**Problem**: Reduce latency and backend load for frequently accessed data like biller MDM.
+**Pros**: High concurrency, non-blocking I/O, efficient resource usage
+**Cons**: More complex than sync database operations, requires async/await everywhere
 
-**Solution**: Redis-based caching layer with TTL-based expiration.
+### 4. Caching Layer
 
-**Implementation** (`app/core/cache.py`):
-- **Redis async client** with connection pooling
-- **Configurable TTL** (default 300 seconds)
-- **Namespace prefixing** to organize cache keys
-- **JSON serialization** for complex objects
-- **Graceful degradation** when Redis is unavailable
+**Problem**: Reduce load on BBPS backend and improve response times for frequently accessed data.
 
-**Cache Usage Pattern**:
-```python
-# Try cache first
-cached = await cache.get(key)
-if cached:
-    return cached
+**Solution**: Redis-based caching with async operations and configurable TTL.
 
-# Fetch from backend/DB
-data = await fetch_data()
+**Implementation**:
+- **Redis async client** using redis-asyncio library
+- **Connection pooling** for Redis connections
+- **CacheService** class with get/set/delete/exists operations
+- **Configurable TTL** via environment variables (default: 300 seconds)
+- **Key prefixing** to avoid collisions (`bbps:`)
+- **Graceful degradation**: System works without Redis if not configured
 
-# Store in cache
-await cache.set(key, data, ttl=300)
-```
+**Key Features**:
+- JSON serialization for complex objects
+- Automatic expiration via TTL
+- Connection pooling for efficiency
+- Async operations for non-blocking I/O
 
-**Rationale**: Biller MDM data changes infrequently, making it ideal for caching. Redis provides fast in-memory storage with automatic expiration.
+**Rationale**: Caching reduces backend load and improves response times for frequently requested data like biller MDM.
+
+**Pros**: Reduced backend load, faster response times, lower latency
+**Cons**: Cache invalidation complexity, additional infrastructure dependency
 
 ### 5. Configuration Management
 
-**Problem**: Need to manage multiple backend URLs, credentials, and environment-specific settings.
+**Problem**: Need flexible configuration for multiple environments without code changes.
 
-**Solution**: Environment variables + YAML configuration files.
+**Solution**: Environment variables with YAML configuration for BBPS backend URLs.
 
-**Architecture** (`app/core/config.py`):
-- **Environment variables** via python-dotenv for sensitive data (secrets, DB URLs)
-- **YAML files** for BBPS backend URL mappings
-- **Settings class** as single source of truth for all configuration
-- **URL builder methods** for constructing full URLs with path/query parameters
+**Implementation**:
+- **Settings class** (`app/core/config.py`) loads from environment variables
+- **YAML configuration** for BBPS backend URLs (`bbps_urls.yaml`)
+- **Dynamic URL construction** with path parameters and query strings
+- **Configuration reload** endpoint for runtime updates
 
-**Configuration Hierarchy**:
-1. Environment variables (.env file)
-2. YAML configuration (bbps_urls.yaml)
-3. Default values in Settings class
+**Key Settings Categories**:
+- **Application**: Name, version, debug mode
+- **Server**: Host, port
+- **Database**: Connection URL, pool settings
+- **Redis**: Connection URL, cache TTL
+- **Auth**: Secret key, token expiration
+- **BBPS**: API keys, timeouts, retry logic
 
-**Rationale**: Separating sensitive credentials (env vars) from structural config (YAML) provides better security while maintaining flexibility.
+**Rationale**: Separates configuration from code, enables environment-specific settings, supports runtime reconfiguration.
 
-### 6. Error Handling & Logging
+### 6. Request/Response Lifecycle
 
-**Problem**: Need comprehensive logging for debugging and monitoring without exposing sensitive data.
+**Problem**: Need consistent logging, error handling, and response formatting across all endpoints.
 
-**Solution**: Structured logging with request/response tracking and error normalization.
+**Solution**: Centralized logging utilities and response normalization.
 
-**Implementation** (`app/core/logging.py`):
-- **BBPSLogger** wrapper around Python logging
-- **Request ID tracking** for correlating logs across the request lifecycle
-- **Structured log format** with timestamps, log levels, and contextual data
-- **Error sanitization** to prevent sensitive data leakage
+**Implementation**:
+- **Request logging**: Captures category, endpoint, method, payload, headers
+- **Response logging**: Records status, duration, response data
+- **Error logging**: Captures exceptions with stack traces
+- **Response normalization**: Standardizes all responses to `BBPSResponse` format
+- **Request ID tracking**: Unique ID for each request for tracing
 
-**Response Normalization** (`app/api/deps.py`):
-- Standardized response format across all endpoints
-- Automatic error extraction from backend responses
-- Success/failure determination based on status codes
+**Key Components**:
+- `app/core/logging.py`: Logging utilities and BBPSLogger class
+- `app/api/deps.py`: Response normalization and dependency injection
+- `app/schemas/responses.py`: Standardized response models
 
-### 7. Retry & Resilience
+**Rationale**: Consistent logging and response format simplifies debugging and client integration.
 
-**Problem**: Handle transient failures when communicating with BBPS backends.
+### 7. API Route Organization
 
-**Solution**: Configurable retry logic with exponential backoff.
+**Problem**: Need to organize multiple BBPS categories and operations in a maintainable structure.
 
-**Implementation** (`app/services/proxy.py`):
-- **Max retries**: 3 attempts (configurable)
-- **Retry delay**: 1 second base delay (configurable)
-- **Timeout handling**: 30-second request timeout
-- **Connection error handling**: Graceful failure with error codes
+**Solution**: Category-based routing with dedicated endpoint modules.
 
-**Rationale**: Network issues and temporary backend unavailability are common in distributed systems. Retry logic improves reliability without requiring client-side changes.
+**Route Categories**:
+- **Health & Config**: System health, configuration management
+- **Authentication**: Login, token refresh, password management
+- **Admin**: Client management, dashboard, audit logs
+- **Monitoring**: Health checks, metrics, system stats
+- **MDM**: Master data management for billers
+- **Bill Fetch**: Fetch bills, validate parameters
+- **Bill Payment**: Process payments, check status
+- **Billers**: List, search, categorize billers
+- **Complaints**: Register, track complaints
+- **Banks**: Bank and IFSC lookup
+- **BBPS Operations**: Advanced BBPS features
+- **Biller Management**: CRUD operations, CSV upload
 
-### 8. API Organization
-
-**Problem**: Managing many BBPS endpoints in a maintainable structure.
-
-**Solution**: Modular router architecture with category-based endpoint grouping.
-
-**Structure**:
-```
-app/api/v1/endpoints/
-├── auth.py          # Authentication (login, token, refresh)
-├── admin.py         # Admin operations (client management, dashboard)
-├── mdm.py           # Master Data Management endpoints
-├── billfetch.py     # Bill fetch operations
-├── billpayment.py   # Bill payment operations
-├── billers.py       # Biller listing and search
-├── complaints.py    # Complaint registration and tracking
-├── banks.py         # Bank and IFSC lookup
-└── monitoring.py    # Health checks and metrics
-```
-
-**Router Registration** (`app/api/v1/router.py`):
-All endpoint modules registered with consistent prefixes and tags for OpenAPI documentation.
-
-**Rationale**: Separation by business domain makes the codebase easier to navigate and allows independent development of different BBPS features.
-
-### 9. Application Lifecycle Management
-
-**Problem**: Properly initialize and cleanup resources (database, Redis) during startup and shutdown.
-
-**Solution**: FastAPI lifespan context manager.
-
-**Implementation** (`app/main.py`):
-```python
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Startup
-    await init_db()
-    
-    yield
-    
-    # Shutdown
-    await close_db()
-    await close_redis()
-```
-
-**Rationale**: Ensures clean resource management, preventing connection leaks and ensuring graceful shutdown.
+**Rationale**: Modular structure improves maintainability, makes it easy to add new categories.
 
 ## External Dependencies
 
-### Required Services
+### Third-Party Services
 
-1. **PostgreSQL Database**
-   - **Purpose**: Persistent storage for clients, transactions, billers, and audit logs
-   - **Connection**: Async via asyncpg driver
-   - **Configuration**: DATABASE_URL environment variable
-   - **Optional**: System works without database but with limited functionality
+1. **BBPS Backend Services**: Real BBPS API endpoints configured via `bbps_urls.yaml`
+   - Purpose: Actual bill payment processing, biller data, complaints
+   - Integration: HTTP requests via httpx with retry logic
+   - Configuration: Base URLs and endpoint paths in YAML
 
-2. **Redis Cache**
-   - **Purpose**: High-speed caching for biller MDM and frequently accessed data
-   - **Connection**: Async Redis client with connection pooling
-   - **Configuration**: REDIS_URL and REDIS_PASSWORD environment variables
-   - **Optional**: System gracefully degrades without Redis
+### Databases
 
-3. **BBPS Backend Services**
-   - **Purpose**: Actual BBPS API endpoints for bill operations
-   - **Configuration**: YAML-based URL mapping in configuration
-   - **Categories**: MDM, bill fetch, bill payment, complaints, banks, billers, monitoring
-   - **Authentication**: API key/secret (BBPS_API_KEY, BBPS_API_SECRET)
+1. **PostgreSQL**: Primary data store
+   - Purpose: Persist clients, billers, transactions, complaints, audit logs
+   - Driver: asyncpg (async PostgreSQL driver)
+   - Connection: Via SQLAlchemy async engine
+   - URL format: `postgresql+asyncpg://user:pass@host:port/dbname`
 
-### Third-Party Python Libraries
+2. **Redis**: Caching layer
+   - Purpose: Cache frequently accessed data (biller MDM, etc.)
+   - Driver: redis-asyncio
+   - Connection: Connection pool with configurable size
+   - Optional: System degrades gracefully if Redis unavailable
 
-**Core Framework**:
-- **FastAPI** (>=0.122.0): Web framework with async support and OpenAPI documentation
-- **Uvicorn** (>=0.38.0): ASGI server for running FastAPI
+### Python Libraries
+
+**Web Framework**:
+- `fastapi`: Modern async web framework
+- `uvicorn`: ASGI server for running FastAPI
+- `pydantic`: Data validation and serialization
 
 **HTTP Client**:
-- **httpx** (>=0.28.1): Async HTTP client for forwarding requests to BBPS backends
-
-**Data Validation**:
-- **Pydantic** (>=2.12.5): Request/response validation and serialization
+- `httpx`: Async HTTP client for forwarding requests to BBPS backend
 
 **Database**:
-- **SQLAlchemy**: Async ORM for database operations
-- **asyncpg**: PostgreSQL async driver
+- `sqlalchemy`: ORM and database toolkit (async mode)
+- `asyncpg`: PostgreSQL async driver
 
 **Caching**:
-- **redis**: Async Redis client
-
-**Authentication & Security**:
-- **python-jose**: JWT token creation and validation
-- **passlib**: Password hashing (bcrypt)
-- **bcrypt**: Secure password hashing algorithm
-
-**Configuration**:
-- **python-dotenv** (>=1.2.1): Environment variable loading
-- **PyYAML** (>=6.0.3): YAML configuration file parsing
-
-**File Handling**:
-- **python-multipart**: Form data and file upload support
-- **aiofiles**: Async file operations
-
-### Environment Variables Required
-
-**Core Application**:
-- `PORT`: Server port (default: 5000)
-- `HOST`: Server host (default: 0.0.0.0)
-- `DEBUG`: Enable debug mode (default: false)
-- `LOG_LEVEL`: Logging level (default: INFO)
-
-**Database**:
-- `DATABASE_URL`: PostgreSQL connection string (optional)
-- `DATABASE_POOL_SIZE`: Connection pool size (default: 10)
-- `DATABASE_MAX_OVERFLOW`: Max overflow connections (default: 20)
-
-**Redis**:
-- `REDIS_URL`: Redis connection string (default: redis://localhost:6379/0)
-- `REDIS_PASSWORD`: Redis password (optional)
-- `CACHE_TTL`: Cache expiration in seconds (default: 300)
+- `redis`: Async Redis client library
 
 **Authentication**:
-- `SECRET_KEY`: JWT signing secret (required)
-- `ACCESS_TOKEN_EXPIRE_MINUTES`: Access token lifetime (default: 30)
-- `REFRESH_TOKEN_EXPIRE_DAYS`: Refresh token lifetime (default: 7)
+- `python-jose`: JWT token creation and verification
+- `passlib`: Password hashing with bcrypt
+- `bcrypt`: Password hashing algorithm
 
-**BBPS Backend**:
-- `BBPS_API_BASE_URL`: Base URL for BBPS backend
-- `BBPS_API_KEY`: API key for BBPS authentication
-- `BBPS_API_SECRET`: API secret for BBPS authentication
+**Configuration**:
+- `python-dotenv`: Environment variable loading
+- `pyyaml`: YAML configuration file parsing
 
-**Request Configuration**:
-- `REQUEST_TIMEOUT`: HTTP timeout in seconds (default: 30)
-- `MAX_RETRIES`: Maximum retry attempts (default: 3)
-- `RETRY_DELAY`: Delay between retries in seconds (default: 1.0)
+**File Handling**:
+- `python-multipart`: Multipart form data parsing for file uploads
+- `aiofiles`: Async file I/O operations
+
+### API Integration Patterns
+
+1. **Request Forwarding**: All BBPS requests forwarded via ProxyForwarder with retry logic
+2. **Response Normalization**: All responses converted to standardized `BBPSResponse` format
+3. **Error Handling**: Connection errors, timeouts, and backend errors handled gracefully
+4. **Retry Logic**: Configurable retries with exponential backoff for failed requests
+5. **Timeout Management**: Configurable timeout for all backend requests (default: 30s)
