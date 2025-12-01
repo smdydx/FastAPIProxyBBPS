@@ -1,0 +1,68 @@
+bbps_backend_urls:
+  monitoring:
+    base_url: "https://your-actual-lcrpay-backend.com/api/v1"
+    health: "/monitoring/health"
+    health_detailed: "/monitoring/health/detailed"
+    health_ready: "/monitoring/health/ready"
+    health_live: "/monitoring/health/live"
+    metrics: "/monitoring/metrics"
+    stats_system: "/monitoring/stats/system"
+    stats_application: "/monitoring/stats/application"
+    stats_cache: "/monitoring/stats/cache"
+
+  mdm:
+    base_url: "https://your-actual-lcrpay-backend.com/api/v1"
+    fetch_single: "/mdm/fetch/single"
+    fetch_multiple: "/mdm/fetch/multiple"
+    fetch_by_category: "/mdm/fetch/by-category"
+    get_single: "/mdm/{biller_id}"
+    get_by_category: "/mdm/category/{category}"
+    search: "/mdm/search"
+    stats: "/mdm/stats"
+    sync_status: "/mdm/sync/status"
+    sync_start: "/mdm/sync/start"
+    sync_category: "/mdm/sync/category"
+    upload_xml: "/mdm/upload/xml"
+    export_category: "/mdm/export/{category}"
+
+  billfetch:
+    base_url: "https://your-actual-lcrpay-backend.com/api/v1"
+    input_params: "/billfetch/input-params/{biller_id}"
+    fetch_bill: "/billfetch/fetch"
+    history: "/billfetch/history"
+    history_by_id: "/billfetch/history/{fetch_id}"
+    validate_params: "/billfetch/validate-params"
+
+  billpayment:
+    base_url: "https://your-actual-lcrpay-backend.com/api/v1"
+    pay_bill: "/billpayment/pay"
+    status: "/billpayment/status/{transaction_id}"
+    history: "/billpayment/history"
+    refund: "/billpayment/refund"
+
+  billers:
+    base_url: "https://your-actual-lcrpay-backend.com/api/v1"
+    list_all: "/billers"
+    get_by_id: "/billers/{biller_id}"
+    by_category: "/billers/category/{category}"
+    search: "/billers/search"
+    categories: "/billers/categories"
+
+  complaints:
+    base_url: "https://your-actual-lcrpay-backend.com/api/v1"
+    register: "/complaints/register"
+    status: "/complaints/status/{complaint_id}"
+    list: "/complaints"
+    update: "/complaints/{complaint_id}"
+
+  banks:
+    base_url: "https://your-actual-lcrpay-backend.com/api/v1"
+    list_all: "/banks"
+    get_by_id: "/banks/{bank_id}"
+    ifsc_list: "/banks/{bank_id}/ifsc"
+    search_ifsc: "/banks/ifsc/search"
+
+api_settings:
+  timeout: 30
+  max_retries: 3
+  retry_delay: 1
