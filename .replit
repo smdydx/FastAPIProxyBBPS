@@ -7,7 +7,7 @@ channel = "stable-25_05"
 packages = ["libxcrypt", "libyaml"]
 
 [workflows]
-runButton = "Start Proxy Server"
+runButton = "Project"
 
 [[workflows.workflow]]
 name = "Project"
@@ -22,13 +22,13 @@ args = "BBPS Proxy API"
 name = "BBPS Proxy API"
 author = "agent"
 
-[[workflows.workflow.tasks]]
-task = "shell.exec"
-args = "python main.py"
-waitForPort = 5000
-
 [workflows.workflow.metadata]
 outputType = "webview"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "uvicorn src.main:app --host 0.0.0.0 --port 5000 --reload"
+waitForPort = 5000
 
 [[workflows.workflow]]
 name = "Start Proxy Server"
@@ -44,5 +44,5 @@ localPort = 5000
 externalPort = 80
 
 [[ports]]
-localPort = 8080
-externalPort = 8080
+localPort = 44297
+externalPort = 3000
