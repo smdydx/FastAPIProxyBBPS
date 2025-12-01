@@ -15,8 +15,9 @@ bbps_backend_urls:
     fetch_single: "/mdm/fetch/single"
     fetch_multiple: "/mdm/fetch/multiple"
     fetch_by_category: "/mdm/fetch/by-category"
-    get_single: "/mdm/{biller_id}"
-    get_by_category: "/mdm/category/{category}"
+    fetch_from_excel: "/mdm/fetch/from-excel"
+    get_single: "/mdm/stored/{biller_id}"
+    get_by_category: "/mdm/stored/by-category/{category}"
     search: "/mdm/search"
     stats: "/mdm/stats"
     sync_status: "/mdm/sync/status"
@@ -24,6 +25,8 @@ bbps_backend_urls:
     sync_category: "/mdm/sync/category"
     upload_xml: "/mdm/upload/xml"
     export_category: "/mdm/export/{category}"
+    configuration: "/mdm/configuration/{biller_id}"
+    configurations: "/mdm/configurations"
 
   billfetch:
     base_url: "https://api.your-real-bbps-backend.com/v1"
@@ -31,6 +34,7 @@ bbps_backend_urls:
     fetch_bill: "/billfetch/fetch"
     history: "/billfetch/history"
     history_by_id: "/billfetch/history/{fetch_id}"
+    history_by_reference: "/billfetch/history/by-reference/{reference_no}"
     validate_params: "/billfetch/validate-params"
 
   billpayment:
@@ -38,6 +42,10 @@ bbps_backend_urls:
     pay_bill: "/billpayment/pay"
     status: "/billpayment/status/{transaction_id}"
     history: "/billpayment/history"
+    history_by_id: "/billpayment/history/{payment_id}"
+    upcoming_dues: "/billpayment/upcoming-dues"
+    alert_settings: "/billpayment/alert-settings/{payment_id}"
+    user_bills: "/billpayment/user-bills/{user_id}"
     refund: "/billpayment/refund"
 
   billers:
