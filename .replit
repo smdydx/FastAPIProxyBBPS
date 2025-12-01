@@ -4,7 +4,7 @@ expertMode = true
 
 [nix]
 channel = "stable-25_05"
-packages = ["libxcrypt", "libyaml"]
+packages = ["cargo", "libiconv", "libxcrypt", "libyaml", "postgresql", "rustc"]
 
 [workflows]
 runButton = "Project"
@@ -44,5 +44,5 @@ localPort = 5000
 externalPort = 80
 
 [[ports]]
-localPort = 46365
+localPort = 41683
 externalPort = 3000

@@ -12,3 +12,11 @@ python-dotenv
 pyyaml
 uvicorn
 python-multipart
+aiofiles
+asyncpg
+bcrypt
+passlib
+python-jose
+python-multipart
+redis
+sqlalchemy

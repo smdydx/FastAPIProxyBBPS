@@ -26,14 +26,50 @@ class Settings:
     MAX_RETRIES: int = int(os.getenv("MAX_RETRIES", "3"))
     RETRY_DELAY: float = float(os.getenv("RETRY_DELAY", "1.0"))
     
+    DATABASE_URL: str = os.getenv("DATABASE_URL", "")
+    DATABASE_POOL_SIZE: int = int(os.getenv("DATABASE_POOL_SIZE", "10"))
+    DATABASE_MAX_OVERFLOW: int = int(os.getenv("DATABASE_MAX_OVERFLOW", "20"))
+    DATABASE_POOL_TIMEOUT: int = int(os.getenv("DATABASE_POOL_TIMEOUT", "30"))
+    DATABASE_ECHO: bool = os.getenv("DATABASE_ECHO", "false").lower() == "true"
+    
+    REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    REDIS_PASSWORD: Optional[str] = os.getenv("REDIS_PASSWORD")
+    CACHE_TTL: int = int(os.getenv("CACHE_TTL", "300"))
+    CACHE_PREFIX: str = os.getenv("CACHE_PREFIX", "bbps:")
+    
+    SECRET_KEY: str = os.getenv("SECRET_KEY", "your-super-secret-key-change-in-production")
+    ALGORITHM: str = os.getenv("ALGORITHM", "HS256")
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
+    REFRESH_TOKEN_EXPIRE_DAYS: int = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "7"))
+    
+    API_KEY_HEADER: str = "X-API-Key"
+    API_KEY_PREFIX: str = "bbps_"
+    
+    BBPS_API_BASE_URL: str = os.getenv("BBPS_API_BASE_URL", "https://api.bbps.org/v1")
+    BBPS_API_KEY: str = os.getenv("BBPS_API_KEY", "")
+    BBPS_API_SECRET: str = os.getenv("BBPS_API_SECRET", "")
+    BBPS_OU_ID: str = os.getenv("BBPS_OU_ID", "")
+    BBPS_AGENT_ID: str = os.getenv("BBPS_AGENT_ID", "")
+    
+    RATE_LIMIT_REQUESTS: int = int(os.getenv("RATE_LIMIT_REQUESTS", "100"))
+    RATE_LIMIT_PERIOD: int = int(os.getenv("RATE_LIMIT_PERIOD", "60"))
+    
+    ALLOWED_ORIGINS: list = os.getenv("ALLOWED_ORIGINS", "*").split(",")
+    
+    CSV_UPLOAD_DIR: Path = APP_DIR / "uploads" / "csv"
+    MAX_UPLOAD_SIZE: int = int(os.getenv("MAX_UPLOAD_SIZE", "10485760"))
+    
     _bbps_config: Optional[Dict[str, Any]] = None
     
     @classmethod
     def get_bbps_config(cls) -> Dict[str, Any]:
         if cls._bbps_config is None:
             config_path = DATA_DIR / "bbps_urls.yaml"
-            with open(config_path, "r") as f:
-                cls._bbps_config = yaml.safe_load(f)
+            if config_path.exists():
+                with open(config_path, "r") as f:
+                    cls._bbps_config = yaml.safe_load(f)
+            else:
+                cls._bbps_config = {"bbps_backend_urls": {}}
         return cls._bbps_config
     
     @classmethod
@@ -72,6 +108,11 @@ class Settings:
     def reload_config(cls) -> None:
         cls._bbps_config = None
         cls.get_bbps_config()
+    
+    @classmethod
+    def ensure_upload_dirs(cls) -> None:
+        cls.CSV_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
 settings = Settings()
+settings.ensure_upload_dirs()

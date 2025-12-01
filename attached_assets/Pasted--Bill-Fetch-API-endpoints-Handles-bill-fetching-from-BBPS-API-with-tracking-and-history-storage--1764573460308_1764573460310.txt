@@ -1,0 +1,906 @@
+"""
+Bill Fetch API endpoints.
+Handles bill fetching from BBPS API with tracking and history storage.
+"""
+
+import logging
+from decimal import Decimal
+from typing import Optional, List, Dict, Any,Tuple
+import xml.etree.ElementTree as ET
+import re
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, func
+from pydantic import BaseModel, Field
+
+from app.core.database import get_db
+from app.models.optimized_models import BillerConfiguration, BillFetchHistory
+from app.services.bbps_api_service_async import async_bbps_api_service
+from app.exceptions import BBPSException
+from app.utils.utils import xml_to_dict
+from app.core.settings import settings
+from app.core.auth import get_current_client
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/billfetch", tags=["Bill Fetch"],
+    dependencies=[Depends(get_current_client)]
+)
+
+
+# ============================================
+# Pydantic Schemas
+# ============================================
+
+
+class InputParamSchema(BaseModel):
+    """Schema for a single input parameter."""
+    param_name: str = Field(..., description="Name of the parameter")
+    data_type: Optional[str] = Field(None, description="Data type (ALPHANUMERIC, NUMERIC)")
+    is_optional: bool = Field(False, description="Whether parameter is optional")
+    min_length: Optional[int] = Field(None, description="Minimum length")
+    max_length: Optional[int] = Field(None, description="Maximum length")
+    regex: Optional[str] = Field(None, description="Validation regex pattern")
+    visibility: Optional[str] = Field(None, description="Visibility (Visible, Hidden)")
+    param_values: Optional[List[str]] = Field(None, description="List of allowed values")
+
+
+class BillerInputParamsResponse(BaseModel):
+    """Response schema for biller input parameters."""
+    success: bool
+    biller_id: str
+    biller_name: Optional[str] = None
+    biller_category: Optional[str] = None
+    fetch_requirement: Optional[str] = None
+    input_params: List[InputParamSchema]
+
+
+class AgentDeviceInfo(BaseModel):
+    """Agent device information for BBPS request."""
+    ip: str = Field(..., description="IP address of the device")
+    init_channel: str = Field(..., description="Channel (AGT, INT, MOB, INTB, etc.)")
+    mac: Optional[str] = Field(None, description="MAC address of the device")
+
+
+class CustomerInfo(BaseModel):
+    """Customer information for BBPS request."""
+    customer_mobile: str = Field(..., description="Customer mobile number (mandatory)")
+    customer_email: Optional[str] = Field(None, description="Customer email")
+    customer_adhaar: Optional[str] = Field(None, description="Customer Aadhaar (masked)")
+    customer_pan: Optional[str] = Field(None, description="Customer PAN (masked)")
+
+
+class BillFetchRequest(BaseModel):
+    """Request schema for bill fetch."""
+    # App and user tracking
+    app_provider: str = Field(..., description="App provider code (LCR, ODH, etc.)")
+    fetched_by_user: str = Field(..., description="User ID initiating the fetch")
+    reference_no: str = Field(..., description="User-supplied reference number")
+
+    # Biller info
+    biller_id: str = Field(..., description="Biller ID (14 chars)")
+    input_params: Dict[str, str] = Field(..., description="Input parameters as key-value pairs")
+
+    # Customer info
+    customer_mobile: str = Field(..., description="Customer mobile number")
+    customer_email: Optional[str] = Field(None, description="Customer email (optional)")
+
+    # Optional
+    amount: Optional[str] = Field(None, description="Amount for recharge billers")
+
+    # Agent device info (optional - defaults will be used)
+    agent_device_info: Optional[AgentDeviceInfo] = Field(None, description="Agent device information")
+
+
+class BillFetchResponse(BaseModel):
+    """Response schema for bill fetch."""
+    success: bool
+    message: str
+    fetch_id: Optional[int] = None
+    biller_id: str
+    reference_no: str
+
+    # Bill details
+    response_code: Optional[str] = None
+    response_reason: Optional[str] = None
+    bill_amount: Optional[float] = None
+    bill_date: Optional[str] = None
+    bill_number: Optional[str] = None
+    bill_period: Optional[str] = None
+    customer_name: Optional[str] = None
+    due_date: Optional[str] = None
+
+    # Additional info
+    additional_info: Optional[Dict[str, Any]] = None
+    amount_options: Optional[Dict[str, Any]] = None
+
+    # Raw response
+    raw_response: Optional[Dict[str, Any]] = None
+
+
+class BillFetchHistoryResponse(BaseModel):
+    """Response schema for bill fetch history."""
+    success: bool
+    total: int
+    data: List[Dict[str, Any]]
+
+
+# ============================================
+# Helper Functions
+# ============================================
+
+
+def parse_input_params_xml(xml_string: str) -> List[InputParamSchema]:
+    """
+    Parse biller input params XML to structured list.
+
+    XML structure:
+    <billerInputParams>
+        <billerInputParams>
+            <paramName>Consumer Number</paramName>
+            <dataType>ALPHANUMERIC</dataType>
+            <isOptional>false</isOptional>
+            <minLength>1</minLength>
+            <maxLength>50</maxLength>
+            <regex>...</regex>
+            <visibility>Visible</visibility>
+            <paramValues>
+                <paramValue>value1</paramValue>
+                <paramValue>value2</paramValue>
+            </paramValues>
+        </billerInputParams>
+    </billerInputParams>
+    """
+    params = []
+    try:
+        # print(xml_string)
+        root = ET.fromstring(xml_string)
+       
+        for param_elem in root.findall('paramInfo'):
+            print(param_elem)
+            param = InputParamSchema(
+                param_name=_get_text(param_elem, 'paramName', ''),
+                data_type=_get_text(param_elem, 'dataType'),
+                is_optional=_get_text(param_elem, 'isOptional', 'false').lower() == 'true',
+                min_length=_get_int(param_elem, 'minLength'),
+                max_length=_get_int(param_elem, 'maxLength'),
+                regex=_get_text(param_elem, 'regex'),
+                visibility=_get_text(param_elem, 'visibility'),
+                param_values=_get_param_values(param_elem),
+            )
+            params.append(param)
+    except ET.ParseError as e:
+        logger.error(f"Error parsing input params XML: {e}")
+    return params
+
+
+def _get_text(elem: ET.Element, tag: str, default: Optional[str] = None) -> Optional[str]:
+    """Get text from child element."""
+    child = elem.find(tag)
+    return child.text if child is not None and child.text else default
+
+
+def _get_int(elem: ET.Element, tag: str) -> Optional[int]:
+    """Get integer from child element."""
+    text = _get_text(elem, tag)
+    if text is None:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
+def _get_param_values(elem: ET.Element) -> Optional[List[str]]:
+    """Get list of param values from paramValues element."""
+    values_elem = elem.find('paramValues')
+    if values_elem is None:
+        return None
+    values = []
+    for value_elem in values_elem.findall('paramValue'):
+        if value_elem.text:
+            values.append(value_elem.text)
+    return values if values else None
+
+
+def parse_bill_fetch_response(response_xml: str) -> Dict[str, Any]:
+    """
+    Parse BBPS bill fetch response XML.
+
+    Response structure:
+    <billFetchResponse>
+        <responseCode>000</responseCode>
+        <responseReason>Success</responseReason>
+        <billerResponse>
+            <billAmount>1000.00</billAmount>
+            <billDate>2024-01-15</billDate>
+            <billNumber>BILL123</billNumber>
+            <billPeriod>Jan 2024</billPeriod>
+            <customerName>John Doe</customerName>
+            <dueDate>2024-01-31</dueDate>
+        </billerResponse>
+        <additionalInfo>...</additionalInfo>
+        <amountOptions>...</amountOptions>
+    </billFetchResponse>
+    """
+    result = {
+        'response_code': None,
+        'response_reason': None,
+        'bill_amount': None,
+        'bill_date': None,
+        'bill_number': None,
+        'bill_period': None,
+        'customer_name': None,
+        'due_date': None,
+        'additional_info': None,
+        'additional_info_xml': None, 
+        'amount_options': None,
+    }
+
+    try:
+        root = ET.fromstring(response_xml)
+
+        result['response_code'] = _get_text(root, 'responseCode')
+        result['response_reason'] = _get_text(root, 'responseReason')
+
+        # Parse billerResponse
+        biller_response = root.find('billerResponse')
+        if biller_response is not None:
+            result['bill_amount'] = _get_text(biller_response, 'billAmount')
+            result['bill_date'] = _get_text(biller_response, 'billDate')
+            result['bill_number'] = _get_text(biller_response, 'billNumber')
+            result['bill_period'] = _get_text(biller_response, 'billPeriod')
+            result['customer_name'] = _get_text(biller_response, 'customerName')
+            result['due_date'] = _get_text(biller_response, 'dueDate')
+
+        # Parse additionalInfo
+        # additional_info = root.find('additionalInfo')
+        # if additional_info is not None:
+        #     result['additional_info'] = xml_to_dict(additional_info)
+        
+        additional_info = root.find('additionalInfo')
+        if additional_info is not None:
+            result['additional_info'] = xml_to_dict(additional_info)
+            # Also store raw XML for direct use in bill payment
+            result['additional_info_xml'] = ET.tostring(additional_info, encoding='unicode')
+
+        # Parse amountOptions
+        amount_options = root.find('amountOptions')
+        if amount_options is not None:
+            result['amount_options'] = xml_to_dict(amount_options)
+
+    except ET.ParseError as e:
+        logger.error(f"Error parsing bill fetch response: {e}")
+
+    return result
+
+
+def validate_input_params(
+    input_params: Dict[str, str],
+    biller_input_params_xml: Optional[str]
+) -> Tuple[bool, List[str]]:
+    """
+    Validate input parameters against biller configuration.
+
+    Args:
+        input_params: User-provided input parameters {param_name: param_value}
+        biller_input_params_xml: XML string containing biller's input param definitions
+
+    Returns:
+        Tuple of (is_valid, list of error messages)
+    """
+    errors = []
+
+    if not biller_input_params_xml:
+        # No input params defined for this biller
+        return True, []
+
+    # Parse the biller's input param definitions
+    required_params = []
+    param_definitions = {}
+
+    try:
+        root = ET.fromstring(biller_input_params_xml)
+        for param_elem in root.findall('paramInfo'):
+            param_name = _get_text(param_elem, 'paramName', '')
+            if not param_name:
+                continue
+
+            is_optional = _get_text(param_elem, 'isOptional', 'false').lower() == 'true'
+            param_def = {
+                'param_name': param_name,
+                'data_type': _get_text(param_elem, 'dataType'),
+                'is_optional': is_optional,
+                'min_length': _get_int(param_elem, 'minLength'),
+                'max_length': _get_int(param_elem, 'maxLength'),
+                'regex': _get_text(param_elem, 'regEx'),  # Note: regEx in XML
+                'param_values': _get_param_values(param_elem),
+            }
+            param_definitions[param_name] = param_def
+
+            if not is_optional:
+                required_params.append(param_name)
+
+    except ET.ParseError as e:
+        logger.error(f"Error parsing biller input params XML: {e}")
+        return False, [f"Invalid biller configuration: {str(e)}"]
+
+    # Check for missing required parameters
+    for required_param in required_params:
+        if required_param not in input_params:
+            errors.append(f"Missing required parameter: {required_param}")
+
+    # Validate each provided parameter
+    for param_name, param_value in input_params.items():
+        if param_name not in param_definitions:
+            # Unknown parameter - could be a warning but we'll allow it
+            logger.warning(f"Unknown parameter provided: {param_name}")
+            continue
+
+        param_def = param_definitions[param_name]
+
+        # Validate data type
+        data_type = param_def.get('data_type')
+        if data_type == 'NUMERIC':
+            if not param_value.isdigit():
+                errors.append(f"Parameter '{param_name}' must be numeric")
+
+        # Validate min length
+        min_length = param_def.get('min_length')
+        if min_length is not None and len(param_value) < min_length:
+            errors.append(f"Parameter '{param_name}' must be at least {min_length} characters")
+
+        # Validate max length
+        max_length = param_def.get('max_length')
+        if max_length is not None and len(param_value) > max_length:
+            errors.append(f"Parameter '{param_name}' must be at most {max_length} characters")
+
+        # Validate regex pattern
+        regex_pattern = param_def.get('regex')
+        if regex_pattern:
+            try:
+                if not re.match(regex_pattern, param_value):
+                    errors.append(f"Parameter '{param_name}' does not match required pattern")
+            except re.error as e:
+                logger.warning(f"Invalid regex pattern for {param_name}: {e}")
+
+        # Validate allowed values
+        allowed_values = param_def.get('param_values')
+        if allowed_values and param_value not in allowed_values:
+            errors.append(f"Parameter '{param_name}' must be one of: {', '.join(allowed_values)}")
+
+    return len(errors) == 0, errors
+
+# ============================================
+# API Endpoints
+# ============================================
+
+
+@router.get("/input-params/{biller_id}", response_model=BillerInputParamsResponse)
+async def get_biller_input_params(
+    biller_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Get biller input parameters as structured JSON.
+
+    Returns the input parameters required to fetch a bill for this biller,
+    including validation rules, data types, and allowed values.
+    """
+    logger.info(f"Getting input params for biller: {biller_id}")
+
+    # Get biller configuration
+    query = select(BillerConfiguration).where(BillerConfiguration.biller_id == biller_id)
+    result = await db.execute(query)
+    config = result.scalar_one_or_none()
+
+    if not config:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Biller configuration not found for: {biller_id}"
+        )
+
+    # Parse input params XML
+    input_params = []
+    if config.biller_input_params_xml:
+        input_params = parse_input_params_xml(config.biller_input_params_xml)
+
+    return BillerInputParamsResponse(
+        success=True,
+        biller_id=biller_id,
+        biller_name=config.biller_name,
+        biller_category=config.biller_category,
+        fetch_requirement=config.biller_fetch_requirement,
+        input_params=input_params,
+    )
+
+
+# @router.post("/fetch", response_model=BillFetchResponse)
+# async def fetch_bill(
+#     request: BillFetchRequest,
+#     db: AsyncSession = Depends(get_db),
+# ):
+#     """
+#     Fetch bill from BBPS API.
+
+#     Requires:
+#     - app_provider: Company code (LCR, ODH, etc.)
+#     - fetched_by_user: User ID initiating the fetch
+#     - reference_no: User-supplied reference number
+#     - biller_id: Target biller ID
+#     - input_params: Biller-specific input parameters
+#     - customer_mobile: Customer's mobile number
+
+#     The request is sent to BBPS API, and both request and response are stored
+#     in the database for tracking and auditing.
+#     """
+#     logger.info(f"Bill fetch request from {request.app_provider}/{request.fetched_by_user} for biller {request.biller_id}")
+
+#     # Validate biller exists and get configuration
+#     query = select(BillerConfiguration).where(BillerConfiguration.biller_id == request.biller_id)
+#     result = await db.execute(query)
+#     config = result.scalar_one_or_none()
+
+#     if not config:
+#         raise HTTPException(
+#             status_code=404,
+#             detail=f"Biller not found: {request.biller_id}"
+#         )
+
+#     # Prepare agent device info
+#     agent_device_info = {
+#         'ip': request.agent_device_info.ip if request.agent_device_info else '127.0.0.1',
+#         'initChannel': request.agent_device_info.init_channel if request.agent_device_info else 'INT',
+#     }
+#     if request.agent_device_info and request.agent_device_info.mac:
+#         agent_device_info['mac'] = request.agent_device_info.mac
+
+#     # Prepare customer info
+#     customer_info = {
+#         'customerMobile': request.customer_mobile,
+#     }
+
+#     # Prepare biller info with input params
+#     biller_info = {
+#         'billerId': request.biller_id,
+#     }
+#     # Add input params to biller info
+#     for param_name, param_value in request.input_params.items():
+#         biller_info[param_name] = param_value
+
+#     # Create history record first (with PENDING status)
+#     history = BillFetchHistory(
+#         app_provider=request.app_provider,
+#         fetched_by_user=request.fetched_by_user,
+#         reference_no=request.reference_no,
+#         biller_id=request.biller_id,
+#         biller_name=config.biller_name,
+#         biller_category=config.biller_category,
+#         customer_mobile=request.customer_mobile,
+#         input_params_json=request.input_params,
+#         status="PENDING",
+#     )
+#     db.add(history)
+#     await db.commit()
+#     await db.refresh(history)
+
+#     try:
+#         # Call BBPS API
+#         response_xml = await async_bbps_api_service.fetch_bill(
+#             agent_id=settings.AGENT_ID,
+#             agent_device_info=agent_device_info,
+#             customer_info=customer_info,
+#             biller_info=biller_info,
+#             amount=request.amount,
+#         )
+
+#         # Parse response
+#         parsed_response = parse_bill_fetch_response(response_xml)
+
+#         # Update history with response
+#         history.response_xml = response_xml
+#         history.response_code = parsed_response['response_code']
+#         history.response_reason = parsed_response['response_reason']
+
+#         if parsed_response['response_code'] == '000':
+#             history.status = "SUCCESS"
+#             if parsed_response['bill_amount']:
+#                 try:
+#                     history.bill_amount = Decimal(parsed_response['bill_amount'])
+#                 except (ValueError, TypeError):
+#                     history.bill_amount = None
+#             history.bill_date = parsed_response['bill_date']
+#             history.bill_number = parsed_response['bill_number']
+#             history.bill_period = parsed_response['bill_period']
+#             history.customer_name = parsed_response['customer_name']
+#             history.due_date = parsed_response['due_date']
+#             history.additional_info_json = parsed_response['additional_info']
+#             history.amount_options_json = parsed_response['amount_options']
+#         else:
+#             history.status = "FAILED"
+#             history.error_message = parsed_response['response_reason']
+
+#         await db.commit()
+
+#         return BillFetchResponse(
+#             success=parsed_response['response_code'] == '000',
+#             message=parsed_response['response_reason'] or 'Bill fetch completed',
+#             fetch_id=history.id,
+#             biller_id=request.biller_id,
+#             reference_no=request.reference_no,
+#             response_code=parsed_response['response_code'],
+#             response_reason=parsed_response['response_reason'],
+#             bill_amount=float(history.bill_amount) if history.bill_amount else None,
+#             bill_date=parsed_response['bill_date'],
+#             bill_number=parsed_response['bill_number'],
+#             bill_period=parsed_response['bill_period'],
+#             customer_name=parsed_response['customer_name'],
+#             due_date=parsed_response['due_date'],
+#             additional_info=parsed_response['additional_info'],
+#             amount_options=parsed_response['amount_options'],
+#         )
+
+#     except BBPSException as e:
+#         # Update history with error
+#         history.status = "FAILED"
+#         history.error_message = e.message
+#         await db.commit()
+
+#         raise HTTPException(status_code=e.status_code, detail=e.message)
+
+#     except Exception as e:
+#         # Update history with error
+#         history.status = "FAILED"
+#         history.error_message = str(e)
+#         await db.commit()
+
+#         logger.error(f"Error during bill fetch: {e}", exc_info=True)
+#         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/fetch", response_model=BillFetchResponse)
+async def fetch_bill(
+    request: BillFetchRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Fetch bill from BBPS API.
+
+    Requires:
+    - app_provider: Company code (LCR, ODH, etc.)
+    - fetched_by_user: User ID initiating the fetch
+    - reference_no: User-supplied reference number
+    - biller_id: Target biller ID
+    - input_params: Biller-specific input parameters
+    - customer_mobile: Customer's mobile number
+
+    The request validates input parameters against biller configuration,
+    then sends to BBPS API. Both request and response are stored
+    in the database for tracking and auditing.
+    """
+    logger.info(f"Bill fetch request from {request.app_provider}/{request.fetched_by_user} for biller {request.biller_id}")
+
+    # Validate biller exists and get configuration
+    query = select(BillerConfiguration).where(BillerConfiguration.biller_id == request.biller_id)
+    result = await db.execute(query)
+    config = result.scalar_one_or_none()
+
+    if not config:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Biller not found: {request.biller_id}"
+        )
+
+    # Validate input parameters against biller configuration
+    is_valid, validation_errors = validate_input_params(
+        request.input_params,
+        config.biller_input_params_xml
+    )
+
+    if not is_valid:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Input parameter validation failed",
+                "errors": validation_errors
+            }
+        )
+
+    # Prepare agent device info as per BBPS documentation
+    agent_device_info = {
+        'ip': request.agent_device_info.ip if request.agent_device_info else '127.0.0.1',
+        'initChannel': request.agent_device_info.init_channel if request.agent_device_info else 'INT',
+    }
+    if request.agent_device_info and request.agent_device_info.mac:
+        agent_device_info['mac'] = request.agent_device_info.mac
+
+    # Prepare customer info
+    customer_info = {
+        'customerMobile': request.customer_mobile,
+    }
+    if request.customer_email:
+        customer_info['customerEmail'] = request.customer_email
+
+    # Create history record first (with PENDING status)
+    history = BillFetchHistory(
+        app_provider=request.app_provider,
+        fetched_by_user=request.fetched_by_user,
+        reference_no=request.reference_no,
+        biller_id=request.biller_id,
+        biller_name=config.biller_name,
+        biller_category=config.biller_category,
+        customer_mobile=request.customer_mobile,
+        input_params_json=request.input_params,
+        status="PENDING",
+    )
+    db.add(history)
+    await db.commit()
+    await db.refresh(history)
+
+    try:
+        # Call BBPS API with correct format
+        # response_xml = await async_bbps_api_service.fetch_bill(
+        #     agent_id=settings.AGENT_ID,
+        #     agent_device_info=agent_device_info,
+        #     customer_info=customer_info,
+        #     biller_id=request.biller_id,
+        #     input_params=request.input_params,
+        # )
+        
+        response_xml, bbps_request_id = await async_bbps_api_service.fetch_bill(
+            agent_id=settings.AGENT_ID,
+            agent_device_info=agent_device_info,
+            customer_info=customer_info,
+            biller_id=request.biller_id,
+            input_params=request.input_params,
+        )
+        
+        
+        print("BBPS Request ID:", bbps_request_id)
+
+        # Parse response
+        parsed_response = parse_bill_fetch_response(response_xml)
+        
+        history.response_xml = response_xml
+        history.bbps_request_id = bbps_request_id  # Store BBPS-generated request ID for bill payment
+        history.response_code = parsed_response['response_code']
+        history.response_reason = parsed_response['response_reason']
+
+        # Update history with response
+        # history.response_xml = response_xml
+        # history.response_code = parsed_response['response_code']
+        # history.response_reason = parsed_response['response_reason']
+
+        if parsed_response['response_code'] == '000':
+            history.status = "SUCCESS"
+            if parsed_response['bill_amount']:
+                try:
+                    history.bill_amount = Decimal(parsed_response['bill_amount'])
+                except (ValueError, TypeError):
+                    history.bill_amount = None
+            history.bill_date = parsed_response['bill_date']
+            history.bill_number = parsed_response['bill_number']
+            history.bill_period = parsed_response['bill_period']
+            history.customer_name = parsed_response['customer_name']
+            history.due_date = parsed_response['due_date']
+            history.additional_info_json = parsed_response['additional_info']
+            history.additional_info_xml = parsed_response['additional_info_xml']
+            history.amount_options_json = parsed_response['amount_options']
+        else:
+            history.status = "FAILED"
+            history.error_message = parsed_response['response_reason']
+
+        await db.commit()
+
+        return BillFetchResponse(
+            success=parsed_response['response_code'] == '000',
+            message=parsed_response['response_reason'] or 'Bill fetch completed',
+            fetch_id=history.id,
+            biller_id=request.biller_id,
+            reference_no=request.reference_no,
+            response_code=parsed_response['response_code'],
+            response_reason=parsed_response['response_reason'],
+            bill_amount=float(history.bill_amount) if history.bill_amount else None,
+            bill_date=parsed_response['bill_date'],
+            bill_number=parsed_response['bill_number'],
+            bill_period=parsed_response['bill_period'],
+            customer_name=parsed_response['customer_name'],
+            due_date=parsed_response['due_date'],
+            additional_info=parsed_response['additional_info'],
+            amount_options=parsed_response['amount_options'],
+        )
+
+    except BBPSException as e:
+        # Update history with error
+        history.status = "FAILED"
+        history.error_message = e.message
+        await db.commit()
+
+        raise HTTPException(status_code=e.status_code, detail=e.message)
+
+    except Exception as e:
+        # Update history with error
+        history.status = "FAILED"
+        history.error_message = str(e)
+        await db.commit()
+
+        logger.error(f"Error during bill fetch: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+
+@router.get("/history")
+async def get_bill_fetch_history(
+    app_provider: Optional[str] = None,
+    fetched_by_user: Optional[str] = None,
+    biller_id: Optional[str] = None,
+    status: Optional[str] = None,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Get bill fetch history with filters.
+
+    Filter by:
+    - app_provider: Filter by app provider code
+    - fetched_by_user: Filter by user ID
+    - biller_id: Filter by biller
+    - status: Filter by status (PENDING, SUCCESS, FAILED)
+    """
+    logger.info(f"Getting bill fetch history: app_provider={app_provider}, user={fetched_by_user}")
+
+    # Build query
+    query = select(BillFetchHistory)
+    count_query = select(func.count(BillFetchHistory.id))
+
+    if app_provider:
+        query = query.where(BillFetchHistory.app_provider == app_provider)
+        count_query = count_query.where(BillFetchHistory.app_provider == app_provider)
+
+    if fetched_by_user:
+        query = query.where(BillFetchHistory.fetched_by_user == fetched_by_user)
+        count_query = count_query.where(BillFetchHistory.fetched_by_user == fetched_by_user)
+
+    if biller_id:
+        query = query.where(BillFetchHistory.biller_id == biller_id)
+        count_query = count_query.where(BillFetchHistory.biller_id == biller_id)
+
+    if status:
+        query = query.where(BillFetchHistory.status == status)
+        count_query = count_query.where(BillFetchHistory.status == status)
+
+    # Get total count
+    count_result = await db.execute(count_query)
+    total = count_result.scalar()
+
+    # Get data with pagination
+    query = query.order_by(BillFetchHistory.fetched_at.desc()).offset(skip).limit(limit)
+    result = await db.execute(query)
+    records = result.scalars().all()
+
+    return {
+        "success": True,
+        "total": total,
+        "skip": skip,
+        "limit": limit,
+        "data": [
+            {
+                "id": r.id,
+                "app_provider": r.app_provider,
+                "fetched_by_user": r.fetched_by_user,
+                "reference_no": r.reference_no,
+                "biller_id": r.biller_id,
+                "biller_name": r.biller_name,
+                "biller_category": r.biller_category,
+                "customer_mobile": r.customer_mobile,
+                "input_params": r.input_params_json,
+                "status": r.status,
+                "response_code": r.response_code,
+                "bill_amount": float(r.bill_amount) if r.bill_amount else None,
+                "bill_date": r.bill_date,
+                "bill_number": r.bill_number,
+                "customer_name": r.customer_name,
+                "due_date": r.due_date,
+                "error_message": r.error_message,
+                "fetched_at": r.fetched_at.isoformat() if r.fetched_at else None,
+            }
+            for r in records
+        ],
+    }
+
+
+@router.get("/history/{fetch_id}")
+async def get_bill_fetch_detail(
+    fetch_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Get detailed bill fetch record by ID.
+
+    Returns complete details including input params, response XML, and additional info.
+    """
+    query = select(BillFetchHistory).where(BillFetchHistory.id == fetch_id)
+    result = await db.execute(query)
+    record = result.scalar_one_or_none()
+
+    if not record:
+        raise HTTPException(status_code=404, detail=f"Bill fetch record not found: {fetch_id}")
+
+    return {
+        "success": True,
+        "data": {
+            "id": record.id,
+            "app_provider": record.app_provider,
+            "fetched_by_user": record.fetched_by_user,
+            "reference_no": record.reference_no,
+            "biller_id": record.biller_id,
+            "biller_name": record.biller_name,
+            "biller_category": record.biller_category,
+            "customer_mobile": record.customer_mobile,
+            "input_params": record.input_params_json,
+            "request_xml": record.request_xml,
+            "response_xml": record.response_xml,
+            "status": record.status,
+            "response_code": record.response_code,
+            "response_reason": record.response_reason,
+            "bill_amount": float(record.bill_amount) if record.bill_amount else None,
+            "bill_date": record.bill_date,
+            "bill_number": record.bill_number,
+            "bill_period": record.bill_period,
+            "customer_name": record.customer_name,
+            "due_date": record.due_date,
+            "additional_info": record.additional_info_json,
+            "amount_options": record.amount_options_json,
+            "error_message": record.error_message,
+            "fetched_at": record.fetched_at.isoformat() if record.fetched_at else None,
+            "created_at": record.created_at.isoformat() if record.created_at else None,
+        },
+    }
+
+
+@router.get("/history/by-reference/{reference_no}")
+async def get_bill_fetch_by_reference(
+    reference_no: str,
+    app_provider: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Get bill fetch record by reference number.
+
+    Optionally filter by app_provider if same reference is used across providers.
+    """
+    query = select(BillFetchHistory).where(BillFetchHistory.reference_no == reference_no)
+
+    if app_provider:
+        query = query.where(BillFetchHistory.app_provider == app_provider)
+
+    query = query.order_by(BillFetchHistory.fetched_at.desc())
+    result = await db.execute(query)
+    records = result.scalars().all()
+
+    if not records:
+        raise HTTPException(status_code=404, detail=f"No records found for reference: {reference_no}")
+
+    return {
+        "success": True,
+        "total": len(records),
+        "data": [
+            {
+                "id": r.id,
+                "app_provider": r.app_provider,
+                "fetched_by_user": r.fetched_by_user,
+                "reference_no": r.reference_no,
+                "biller_id": r.biller_id,
+                "biller_name": r.biller_name,
+                "status": r.status,
+                "response_code": r.response_code,
+                "bill_amount": float(r.bill_amount) if r.bill_amount else None,
+                "customer_name": r.customer_name,
+                "fetched_at": r.fetched_at.isoformat() if r.fetched_at else None,
+            }
+            for r in records
+        ],
+    }
