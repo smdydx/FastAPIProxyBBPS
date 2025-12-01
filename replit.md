@@ -6,39 +6,54 @@ A production-ready FastAPI proxy system for Bharat Bill Payment System (BBPS) op
 ## Project Architecture
 
 ```
-.
+app/
+├── __init__.py                      # Application package
 ├── main.py                          # FastAPI application entry point
-├── src/
-│   ├── config/
-│   │   ├── settings.py              # Application settings and configuration loader
-│   │   └── bbps_urls.yaml           # BBPS backend URL mappings (configurable)
-│   ├── models/
-│   │   ├── requests.py              # Generic request models
-│   │   ├── bbps_requests.py         # BBPS-specific request models
-│   │   └── responses.py             # Pydantic response models
-│   ├── routes/
-│   │   ├── base_router.py           # Base router factory with response normalization
-│   │   ├── health.py                # Health check and config endpoints
-│   │   ├── monitoring.py            # Monitoring, metrics, and system stats
-│   │   ├── mdm.py                   # MDM (Master Data Management) endpoints
-│   │   ├── billfetch.py             # Bill fetch endpoints
-│   │   ├── billpayment.py           # Bill payment endpoints
-│   │   ├── billers.py               # Biller listing and search
-│   │   ├── complaints.py            # Complaint registration and tracking
-│   │   └── banks.py                 # Bank and IFSC lookup
-│   ├── services/
-│   │   └── proxy_forwarder.py       # Reusable proxy forwarder with retry logic
-│   └── utils/
-│       └── logger.py                # Logging utilities
-└── pyproject.toml                   # Python dependencies
+├── core/
+│   ├── __init__.py
+│   ├── config.py                    # Application settings and configuration
+│   └── logging.py                   # Logging utilities
+├── api/
+│   ├── __init__.py
+│   ├── deps.py                      # Common dependencies and utilities
+│   └── v1/
+│       ├── __init__.py
+│       ├── router.py                # Main API router
+│       └── endpoints/
+│           ├── __init__.py
+│           ├── health.py            # Health check and config endpoints
+│           ├── monitoring.py        # Monitoring, metrics, and system stats
+│           ├── mdm.py               # MDM (Master Data Management) endpoints
+│           ├── billfetch.py         # Bill fetch endpoints
+│           ├── billpayment.py       # Bill payment endpoints
+│           ├── billers.py           # Biller listing and search
+│           ├── complaints.py        # Complaint registration and tracking
+│           └── banks.py             # Bank and IFSC lookup
+├── schemas/
+│   ├── __init__.py
+│   ├── requests.py                  # Generic request models
+│   ├── responses.py                 # Response models
+│   └── bbps.py                      # BBPS-specific request models
+├── services/
+│   ├── __init__.py
+│   └── proxy.py                     # Reusable proxy forwarder with retry logic
+└── data/
+    └── bbps_urls.yaml               # BBPS backend URL mappings
 ```
 
 ## API Endpoints
 
-### Monitoring (`/api/v1/monitoring`)
+### Health & Configuration (`/api/v1`)
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/health` | Basic health check |
+| GET | `/categories` | List available BBPS categories |
+| POST | `/config/reload` | Reload configuration |
+
+### Monitoring (`/api/v1/monitoring`)
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/health` | Backend health check |
 | GET | `/health/detailed` | Detailed health with DB/Cache status |
 | GET | `/health/ready` | Kubernetes readiness probe |
 | GET | `/health/live` | Kubernetes liveness probe |
@@ -108,7 +123,7 @@ A production-ready FastAPI proxy system for Bharat Bill Payment System (BBPS) op
 
 ### Changing BBPS Backend URLs
 
-1. **Via YAML Config**: Edit `src/config/bbps_urls.yaml`
+1. **Via YAML Config**: Edit `app/data/bbps_urls.yaml`
 2. **Via Environment Variables**: Set `BBPS_{CATEGORY}_BASE_URL`
 
 Example environment variables:
@@ -129,9 +144,7 @@ Example environment variables:
 ## Running the Application
 
 ```bash
-python main.py
-# or
-uvicorn main:app --host 0.0.0.0 --port 5000 --reload
+uvicorn app.main:app --host 0.0.0.0 --port 5000 --reload
 ```
 
 ## API Documentation
@@ -139,8 +152,12 @@ uvicorn main:app --host 0.0.0.0 --port 5000 --reload
 - ReDoc: http://localhost:5000/redoc
 
 ## Recent Changes
-- **2025-11-30**: Restructured to match actual BBPS service architecture
-- Added monitoring, MDM, billfetch, billpayment, billers, complaints, banks routes
+- **2025-12-01**: Restructured to proper FastAPI folder convention
+  - Created `app/` directory with core, api, schemas, services modules
+  - Organized endpoints under `app/api/v1/endpoints/`
+  - Moved schemas to `app/schemas/`
+  - Moved services to `app/services/`
+  - Updated configuration to `app/core/config.py`
 - Config-based URL mapping system
 - Comprehensive logging and error handling
 - Response normalization with BBPSResponse schema
