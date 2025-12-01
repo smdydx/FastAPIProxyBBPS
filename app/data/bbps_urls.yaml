@@ -1,0 +1,97 @@
+bbps_backend_urls:
+  monitoring:
+    base_url: "https://api.your-real-bbps-backend.com/v1"
+    health: "/monitoring/health"
+    health_detailed: "/monitoring/health/detailed"
+    health_ready: "/monitoring/health/ready"
+    health_live: "/monitoring/health/live"
+    metrics: "/monitoring/metrics"
+    stats_system: "/monitoring/stats/system"
+    stats_application: "/monitoring/stats/application"
+    stats_cache: "/monitoring/stats/cache"
+
+  mdm:
+    base_url: "https://your-actual-lcrpay-backend.com/api/v1"
+    fetch_single: "/mdm/fetch/single"
+    fetch_multiple: "/mdm/fetch/multiple"
+    fetch_by_category: "/mdm/fetch/by-category"
+    fetch_from_excel: "/mdm/fetch/from-excel"
+    get_single: "/mdm/stored/{biller_id}"
+    get_by_category: "/mdm/stored/by-category/{category}"
+    search: "/mdm/search"
+    stats: "/mdm/stats"
+    sync_status: "/mdm/sync/status"
+    sync_start: "/mdm/sync/start"
+    sync_category: "/mdm/sync/category"
+    upload_xml: "/mdm/upload/xml"
+    export_category: "/mdm/export/{category}"
+    configuration: "/mdm/configuration/{biller_id}"
+    configurations: "/mdm/configurations"
+
+  billfetch:
+    base_url: "https://api.your-real-bbps-backend.com/v1"
+    input_params: "/billfetch/input-params/{biller_id}"
+    fetch_bill: "/billfetch/fetch"
+    history: "/billfetch/history"
+    history_by_id: "/billfetch/history/{fetch_id}"
+    history_by_reference: "/billfetch/history/by-reference/{reference_no}"
+    validate_params: "/billfetch/validate-params"
+
+  billpayment:
+    base_url: "https://your-actual-lcrpay-backend.com/api/v1"
+    pay_bill: "/billpayment/pay"
+    status: "/billpayment/status/{transaction_id}"
+    history: "/billpayment/history"
+    history_by_id: "/billpayment/history/{payment_id}"
+    upcoming_dues: "/billpayment/upcoming-dues"
+    alert_settings: "/billpayment/alert-settings/{payment_id}"
+    user_bills: "/billpayment/user-bills/{user_id}"
+    refund: "/billpayment/refund"
+
+  billers:
+    base_url: "https://your-actual-lcrpay-backend.com/api/v1"
+    list_all: "/billers"
+    get_by_id: "/billers/{biller_id}"
+    by_category: "/billers/category/{category}"
+    search: "/billers/search"
+    categories: "/billers/categories"
+
+  complaints:
+    base_url: "https://your-actual-lcrpay-backend.com/api/v1"
+    register: "/complaints/register"
+    status: "/complaints/status/{complaint_id}"
+    list: "/complaints"
+    update: "/complaints/{complaint_id}"
+
+  banks:
+    base_url: "https://your-actual-lcrpay-backend.com/api/v1"
+    list_all: "/banks"
+    get_by_id: "/banks/{bank_id}"
+    ifsc_list: "/banks/{bank_id}/ifsc"
+    search_ifsc: "/banks/ifsc/search"
+
+  admin:
+    base_url: "https://your-actual-lcrpay-backend.com/api/v1"
+    upload_excel: "/admin/upload/excel"
+    stats: "/admin/stats"
+    categories: "/admin/categories"
+    sync_billers: "/admin/sync/billers"
+
+  auth:
+    base_url: "https://your-actual-lcrpay-backend.com/api/v1"
+    register: "/auth/register"
+    login: "/auth/login"
+    refresh: "/auth/refresh"
+    me: "/auth/me"
+
+  biller_management:
+    base_url: "https://your-actual-lcrpay-backend.com/api/v1"
+    upload_csv: "/biller-management/upload/csv"
+    bulk_insert: "/biller-management/bulk/insert"
+    bulk_update: "/biller-management/bulk/update"
+    bulk_delete: "/biller-management/bulk/delete"
+
+api_settings:
+  timeout: 30
+  max_retries: 3
+  retry_delay: 1
