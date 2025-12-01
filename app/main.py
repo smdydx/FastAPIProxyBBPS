@@ -124,29 +124,10 @@ app.include_router(api_router, prefix="/api/v1")
 
 @app.get("/")
 async def root():
-    db_status = "connected" if get_engine() else "not configured"
-    
     return JSONResponse(content={
         "service": settings.APP_NAME,
         "version": settings.APP_VERSION,
-        "status": "running",
-        "database": db_status,
-        "documentation": "/docs",
-        "health_check": "/api/v1/health",
-        "endpoints": {
-            "auth": "/api/v1/auth",
-            "admin": "/api/v1/admin",
-            "monitoring": "/api/v1/monitoring",
-            "mdm": "/api/v1/mdm",
-            "billers": "/api/v1/billers",
-            "billfetch": "/api/v1/billfetch",
-            "billpayment": "/api/v1/billpayment",
-            "complaints": "/api/v1/complaints",
-            "banks": "/api/v1/banks",
-            "bbps": "/api/v1/bbps",
-            "management": "/api/v1/management"
-        },
-        "timestamp": datetime.utcnow().isoformat()
+        "status": "running"
     })
 
 
