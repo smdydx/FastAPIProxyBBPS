@@ -1,0 +1,1315 @@
+"""
+Bill Payment API endpoints.
+Handles bill payment via BBPS API with tracking and history storage.
+"""
+
+import logging
+from decimal import Decimal
+from datetime import datetime, timedelta
+from typing import Optional, List, Dict, Any
+import xml.etree.ElementTree as ET
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, func, and_
+from pydantic import BaseModel, Field
+
+from app.core.database import get_db
+from app.models.optimized_models import (
+    BillerConfiguration,
+    BillFetchHistory,
+    PaidBillHistory,
+    BBPSTransactions,
+)
+from app.services.bbps_api_service_async import async_bbps_api_service
+from app.exceptions import BBPSException
+from app.utils.utils import xml_to_dict
+from app.core.settings import settings
+from app.core.auth import get_current_client
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/billpayment", tags=["Bill Payment"],
+dependencies=[Depends(get_current_client)]
+)
+
+
+# ============================================
+# Pydantic Schemas
+# ============================================
+
+
+class AgentDeviceInfo(BaseModel):
+    """Agent device information for BBPS request."""
+    app: str = Field(default="BBPS_APP", description="Application name")
+    imei: str = Field(default="", description="IMEI number")
+    ip: str = Field(..., description="IP address of the device")
+    init_channel: str = Field(..., description="Channel (AGT, INT, MOB, INTB, MOBB, etc.)")
+    os: str = Field(default="Android", description="Operating system")
+
+
+class CustomerInfo(BaseModel):
+    """Customer information for BBPS request."""
+    customer_mobile: str = Field(..., description="Customer mobile number (mandatory)")
+    customer_email: Optional[str] = Field(None, description="Customer email")
+
+
+class AmountInfo(BaseModel):
+    """Amount information for bill payment."""
+    amount: int = Field(..., description="Amount in paise (e.g., 10000 for Rs. 100)")
+    currency: str = Field(default="356", description="Currency code (356 for INR)")
+    ccf1: str = Field(default="0", description="Customer convenience fee component 1")
+    cust_conv_fee: str = Field(default="0", description="Total customer convenience fee")
+    amount_tags: Optional[str] = Field(default="", description="Amount tags if any")
+
+
+class PaymentMethod(BaseModel):
+    """Payment method details."""
+    payment_mode: str = Field(..., description="Payment mode (Cash, InternetBanking, DebitCard, CreditCard, UPI, etc.)")
+    quick_pay: str = Field(default="N", description="Quick pay flag (Y/N)")
+    split_pay: str = Field(default="N", description="Split pay flag (Y/N)")
+
+
+class BillerResponse(BaseModel):
+    """Biller response from bill fetch (optional)."""
+    bill_amount: Optional[str] = Field(None, description="Bill amount from fetch response")
+    amount_options: Optional[str] = Field(None, description="Amount options from fetch response")
+
+
+class BillPaymentRequest(BaseModel):
+    """Request schema for bill payment."""
+    # App and user tracking
+    app_provider: str = Field(..., description="App provider code (LCR, ODH, etc.)")
+    paid_by_user: str = Field(..., description="User ID making the payment")
+    reference_no: str = Field(..., description="User-supplied reference number")
+
+    # Biller info
+    biller_id: str = Field(..., description="Biller ID (14 chars)")
+
+    # Input params (same as used in bill fetch)
+    input_params: Dict[str, str] = Field(..., description="Input parameters as key-value pairs")
+
+    # Customer info
+    customer_info: CustomerInfo = Field(..., description="Customer information")
+
+    # Amount info
+    amount_info: AmountInfo = Field(..., description="Amount details")
+
+    # Payment method
+    payment_method: PaymentMethod = Field(..., description="Payment method details")
+
+    # Payment info (varies by payment mode)
+    payment_info: Dict[str, str] = Field(..., description="Payment info (IFSC, AccountNo, VPA, etc.)")
+
+    # Agent device info (optional - defaults will be used)
+    agent_device_info: Optional[AgentDeviceInfo] = Field(None, description="Agent device information")
+
+    # Optional - from bill fetch response
+    # additional_info: Optional[Dict[str, str]] = Field(None, description="Additional info from bill fetch")
+    biller_response: Optional[BillerResponse] = Field(None, description="Biller response from bill fetch")
+
+    # Bill details for storing in history
+    bill_number: Optional[str] = Field(None, description="Bill number")
+    bill_period: Optional[str] = Field(None, description="Bill period")
+    bill_date: Optional[str] = Field(None, description="Bill date")
+    due_date: Optional[str] = Field(None, description="Due date for alert tracking")
+    customer_name: Optional[str] = Field(None, description="Customer name from bill fetch")
+
+    # Alert settings
+    billing_cycle_days: Optional[int] = Field(default=30, description="Billing cycle in days for next due calculation")
+    alert_days_before: Optional[int] = Field(default=5, description="Days before due date to send alert")
+
+
+class BillPaymentResponse(BaseModel):
+    """Response schema for bill payment."""
+    success: bool
+    message: str
+    payment_id: Optional[int] = None
+    biller_id: str
+    reference_no: str
+
+    # Transaction details
+    response_code: Optional[str] = None
+    response_reason: Optional[str] = None
+    txn_reference_no: Optional[str] = None
+    approval_ref_no: Optional[str] = None
+
+    # Amount paid
+    amount_paid: Optional[float] = None
+
+    # Raw response
+    raw_response: Optional[Dict[str, Any]] = None
+
+
+class UpcomingDueResponse(BaseModel):
+    """Response for upcoming due bills."""
+    success: bool
+    total: int
+    data: List[Dict[str, Any]]
+
+
+# ============================================
+# Helper Functions
+# ============================================
+
+
+def parse_bill_payment_response(response_xml: str) -> Dict[str, Any]:
+    """
+    Parse BBPS bill payment response XML.
+
+    Response structure:
+    <ExtBillPayResponse>
+        <responseCode>000</responseCode>
+        <responseReason>Success</responseReason>
+        <txnReferenceId>BBPS123456</txnReferenceId>
+        <approvalRefNum>APR123456</approvalRefNum>
+        ...
+    </ExtBillPayResponse>
+    """
+    result = {
+        'response_code': None,
+        'response_reason': None,
+        'txn_reference_no': None,
+        'approval_ref_no': None,
+    }
+
+    try:
+        root = ET.fromstring(response_xml)
+
+        result['response_code'] = _get_text(root, 'responseCode')
+        result['response_reason'] = _get_text(root, 'responseReason')
+        result['txn_reference_no'] = _get_text(root, 'txnReferenceId')
+        result['approval_ref_no'] = _get_text(root, 'approvalRefNum')
+
+    except ET.ParseError as e:
+        logger.error(f"Error parsing bill payment response: {e}")
+
+    return result
+
+
+def _get_text(elem: ET.Element, tag: str, default: Optional[str] = None) -> Optional[str]:
+    """Get text from child element."""
+    child = elem.find(tag)
+    return child.text if child is not None and child.text else default
+
+
+def extract_bill_fetch_data(response_xml: str) -> Dict[str, Any]:
+    """
+    Extract additionalInfo and billerResponse from bill fetch response XML.
+
+    This function parses the stored response_xml from BillFetchHistory
+    and extracts the additionalInfo and billerResponse sections as raw XML
+    for direct use in the bill payment request.
+
+    Args:
+        response_xml: The stored bill fetch response XML string
+
+    Returns:
+        Dict with keys:
+            - additional_info_xml: Raw XML string of <additionalInfo>...</additionalInfo>
+            - biller_response_xml: Raw XML string of <billerResponse>...</billerResponse>
+            - biller_response: Dict with billAmount, customerName, etc. for backward compatibility
+
+    Example input:
+        <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        <billFetchResponse>
+            <responseCode>000</responseCode>
+            <billerResponse>
+                <billAmount>1000</billAmount>
+                <customerName>John Doe</customerName>
+            </billerResponse>
+            <additionalInfo>
+                <info>
+                    <infoName>Max Amount</infoName>
+                    <infoValue>25000</infoValue>
+                </info>
+            </additionalInfo>
+        </billFetchResponse>
+    """
+    result = {
+        'additional_info_xml': None,
+        'biller_response_xml': None,
+        'biller_response': None,
+    }
+
+    if not response_xml:
+        return result
+
+    try:
+        root = ET.fromstring(response_xml)
+
+        # Extract additionalInfo as raw XML
+        additional_info_elem = root.find('additionalInfo')
+        if additional_info_elem is not None:
+            # Convert element back to XML string
+            result['additional_info_xml'] = ET.tostring(
+                additional_info_elem,
+                encoding='unicode',
+                method='xml'
+            )
+            logger.debug(f"Extracted additionalInfo XML: {result['additional_info_xml'][:100]}...")
+
+        # Extract billerResponse as raw XML and as dict
+        biller_response_elem = root.find('billerResponse')
+        if biller_response_elem is not None:
+            # Convert element back to XML string
+            result['biller_response_xml'] = ET.tostring(
+                biller_response_elem,
+                encoding='unicode',
+                method='xml'
+            )
+
+            # Also extract as dict for backward compatibility
+            result['biller_response'] = {
+                'billAmount': _get_text(biller_response_elem, 'billAmount', ''),
+                'customerName': _get_text(biller_response_elem, 'customerName', ''),
+                'amountOptions': _get_text(biller_response_elem, 'amountOptions', ''),
+            }
+            logger.debug(f"Extracted billerResponse: {result['biller_response']}")
+
+    except ET.ParseError as e:
+        logger.error(f"Error parsing bill fetch response XML: {e}")
+    except Exception as e:
+        logger.error(f"Error extracting bill fetch data: {e}", exc_info=True)
+
+    return result
+
+
+
+
+
+def calculate_next_due_date(
+    due_date_str: Optional[str],
+    billing_cycle_days: int = 30
+) -> Optional[datetime]:
+    """
+    Calculate the next due date based on billing cycle.
+
+    Args:
+        due_date_str: Due date string from bill (format: YYYY-MM-DD or DD-MM-YYYY)
+        billing_cycle_days: Billing cycle in days (default 30)
+
+    Returns:
+        Next due date as datetime or None
+    """
+    if not due_date_str:
+        # If no due date, estimate next due based on billing cycle from today
+        return datetime.now() + timedelta(days=billing_cycle_days)
+
+    try:
+        # Try parsing different date formats
+        for fmt in ['%Y-%m-%d', '%d-%m-%Y', '%d/%m/%Y', '%Y/%m/%d']:
+            try:
+                due_date = datetime.strptime(due_date_str, fmt)
+                # Calculate next due date
+                next_due = due_date + timedelta(days=billing_cycle_days)
+                return next_due
+            except ValueError:
+                continue
+
+        logger.warning(f"Could not parse due date: {due_date_str}")
+        return datetime.now() + timedelta(days=billing_cycle_days)
+
+    except Exception as e:
+        logger.error(f"Error calculating next due date: {e}")
+        return None
+
+
+# ============================================
+# API Endpoints
+# ============================================
+
+
+# @router.post("/pay", response_model=BillPaymentResponse)
+# async def pay_bill(
+#     request: BillPaymentRequest,
+#     db: AsyncSession = Depends(get_db),
+# ):
+#     """
+#     Pay bill via BBPS API.
+
+#     Requires:
+#     - app_provider: Company code (LCR, ODH, etc.)
+#     - paid_by_user: User ID making the payment
+#     - reference_no: User-supplied reference number
+#     - biller_id: Target biller ID
+#     - input_params: Biller-specific input parameters (same as bill fetch)
+#     - customer_info: Customer mobile and email
+#     - amount_info: Amount in paise, currency, CCF details
+#     - payment_method: Payment mode (Cash, UPI, etc.)
+#     - payment_info: Payment details based on mode (VPA for UPI, IFSC/AccountNo for NetBanking, etc.)
+
+#     The request is sent to BBPS API, and both request and response are stored
+#     in the database. Successful payments are also stored in PaidBillHistory
+#     for due date tracking and alerts.
+#     """
+#     logger.info(f"Bill payment request from {request.app_provider}/{request.paid_by_user} for biller {request.biller_id}")
+
+#     # Validate biller exists and get configuration
+#     query = select(BillerConfiguration).where(BillerConfiguration.biller_id == request.biller_id)
+#     result = await db.execute(query)
+#     config = result.scalar_one_or_none()
+
+#     if not config:
+#         raise HTTPException(
+#             status_code=404,
+#             detail=f"Biller not found: {request.biller_id}"
+#         )
+
+#     # Prepare agent device info as per BBPS documentation
+#     agent_device_info = {
+#         'app': request.agent_device_info.app if request.agent_device_info else 'LCRPAY',
+#         'imei': request.agent_device_info.imei if request.agent_device_info else '000000000000000',
+#         'ip': request.agent_device_info.ip if request.agent_device_info else '127.0.0.1',
+#         'initChannel': request.agent_device_info.init_channel if request.agent_device_info else 'INT',
+#         'os': request.agent_device_info.os if request.agent_device_info else 'Android',
+#     }
+
+#     # Prepare customer info
+#     customer_info = {
+#         'customerMobile': request.customer_info.customer_mobile,
+#         'customerEmail': request.customer_info.customer_email or '',
+#     }
+
+#     # Prepare amount info
+#     amount_info = {
+#         'amount': request.amount_info.amount,
+#         'currency': request.amount_info.currency,
+#         'CCF1': request.amount_info.ccf1,
+#         'custConvFee': request.amount_info.cust_conv_fee,
+#         'amountTags': request.amount_info.amount_tags or '',
+#     }
+
+#     # Prepare payment method
+#     payment_method = {
+#         'paymentMode': request.payment_method.payment_mode,
+#         'quickPay': request.payment_method.quick_pay,
+#         'splitPay': request.payment_method.split_pay,
+#     }
+
+#     # Prepare biller response (optional)
+#     biller_response = None
+#     if request.biller_response:
+#         biller_response = {
+#             'billAmount': request.biller_response.bill_amount or '',
+#             'amountOptions': request.biller_response.amount_options or '',
+#         }
+
+#     try:
+#         # Call BBPS API
+#         response_xml = await async_bbps_api_service.pay_bill(
+#             agent_id=settings.AGENT_ID,
+#             agent_device_info=agent_device_info,
+#             customer_info=customer_info,
+#             biller_id=request.biller_id,
+#             biller_adhoc=config.biller_adhoc or False,  # Get from biller configuration
+#             amount_info=amount_info,
+#             input_params=request.input_params,
+#             payment_info=request.payment_info,
+#             payment_method=payment_method,
+#             additional_info=request.additional_info,
+#             biller_response=biller_response,
+#         )
+
+#         # Parse response
+#         parsed_response = parse_bill_payment_response(response_xml)
+
+#         # Calculate amount in rupees
+#         amount_rupees = Decimal(request.amount_info.amount) / 100
+
+#         # Determine status
+#         is_success = parsed_response['response_code'] == '000'
+#         status = "SUCCESS" if is_success else "FAILED"
+
+#         # Create transaction record
+#         transaction = BBPSTransactions(
+#             client=request.app_provider,
+#             biller_id=request.biller_id,
+#             biller_name=config.biller_name,
+#             category=config.biller_category,
+#             mobile_number=request.customer_info.customer_mobile,
+#             customer_name=request.customer_name,
+#             amount=amount_rupees,
+#             sent_reference_no=request.reference_no,
+#             txn_reference_no=parsed_response['txn_reference_no'],
+#             approval_reference_no=parsed_response['approval_ref_no'],
+#             status=status,
+#             payment_mode=request.payment_method.payment_mode,
+#             response_xml=response_xml,
+#         )
+#         db.add(transaction)
+#         await db.commit()
+#         await db.refresh(transaction)
+
+#         # If successful, also store in PaidBillHistory for due date tracking
+#         if is_success:
+#             next_due = calculate_next_due_date(
+#                 request.due_date,
+#                 request.billing_cycle_days or 30
+#             )
+
+#             paid_history = PaidBillHistory(
+#                 app_provider=request.app_provider,
+#                 paid_by_user=request.paid_by_user,
+#                 biller_id=request.biller_id,
+#                 biller_name=config.biller_name,
+#                 biller_category=config.biller_category,
+#                 customer_mobile=request.customer_info.customer_mobile,
+#                 customer_name=request.customer_name,
+#                 customer_email=request.customer_info.customer_email,
+#                 input_params_json=request.input_params,
+#                 bill_amount=amount_rupees,
+#                 bill_number=request.bill_number,
+#                 bill_period=request.bill_period,
+#                 bill_date=request.bill_date,
+#                 due_date=request.due_date,
+#                 next_due_date=next_due,
+#                 billing_cycle_days=request.billing_cycle_days or 30,
+#                 payment_mode=request.payment_method.payment_mode,
+#                 txn_reference_no=parsed_response['txn_reference_no'],
+#                 approval_ref_no=parsed_response['approval_ref_no'],
+#                 sent_reference_no=request.reference_no,
+#                 status="SUCCESS",
+#                 alert_days_before=request.alert_days_before or 5,
+#                 alert_enabled=True,
+#                 additional_info_json=request.additional_info,
+#             )
+#             db.add(paid_history)
+#             await db.commit()
+
+#         return BillPaymentResponse(
+#             success=is_success,
+#             message=parsed_response['response_reason'] or ('Payment successful' if is_success else 'Payment failed'),
+#             payment_id=transaction.id,
+#             biller_id=request.biller_id,
+#             reference_no=request.reference_no,
+#             response_code=parsed_response['response_code'],
+#             response_reason=parsed_response['response_reason'],
+#             txn_reference_no=parsed_response['txn_reference_no'],
+#             approval_ref_no=parsed_response['approval_ref_no'],
+#             amount_paid=float(amount_rupees),
+#         )
+
+#     except ValueError as e:
+#         # Validation error (e.g., missing payment info fields)
+#         logger.error(f"Validation error during payment: {e}")
+#         raise HTTPException(status_code=400, detail=str(e))
+
+#     except BBPSException as e:
+#         logger.error(f"BBPS error during payment: {e.message}")
+#         raise HTTPException(status_code=e.status_code, detail=e.message)
+
+#     except Exception as e:
+#         logger.error(f"Error during bill payment: {e}", exc_info=True)
+#         raise HTTPException(status_code=500, detail=str(e))
+
+
+# @router.post("/pay", response_model=BillPaymentResponse)
+# async def pay_bill(
+#     request: BillPaymentRequest,
+#     db: AsyncSession = Depends(get_db),
+# ):
+#     """
+#     Pay bill via BBPS API.
+
+#     Requires:
+#     - app_provider: Company code (LCR, ODH, etc.)
+#     - paid_by_user: User ID making the payment
+#     - reference_no: User-supplied reference number
+#     - biller_id: Target biller ID
+#     - input_params: Biller-specific input parameters (same as bill fetch)
+#     - customer_info: Customer mobile and email
+#     - amount_info: Amount in paise, currency, CCF details
+#     - payment_method: Payment mode (Cash, UPI, etc.)
+#     - payment_info: Payment details based on mode (VPA for UPI, IFSC/AccountNo for NetBanking, etc.)
+
+#     The request is sent to BBPS API, and both request and response are stored
+#     in the database. Successful payments are also stored in PaidBillHistory
+#     for due date tracking and alerts.
+#     """
+#     logger.info(f"Bill payment request from {request.app_provider}/{request.paid_by_user} for biller {request.biller_id}")
+
+#     # Validate biller exists and get configuration
+#     query = select(BillerConfiguration).where(BillerConfiguration.biller_id == request.biller_id)
+#     result = await db.execute(query)
+#     config = result.scalar_one_or_none()
+
+#     if not config:
+#         raise HTTPException(
+#             status_code=404,
+#             detail=f"Biller not found: {request.biller_id}"
+#         )
+
+#     # Check if bill fetch is mandatory for this biller
+#     # Per BBPS spec: If Fetch is Mandatory, the same Request ID needs to be used in Payment API
+#     biller_adhoc = config.biller_adhoc or False
+#     fetch_requirement = config.biller_fetch_requirement or ""
+
+#     if not biller_adhoc and fetch_requirement.upper() == "MANDATORY":
+#         # Verify that a successful bill fetch exists with the same reference_no
+#         fetch_query = select(BillFetchHistory).where(
+#             and_(
+#                 BillFetchHistory.reference_no == request.reference_no,
+#                 BillFetchHistory.biller_id == request.biller_id,
+#                 BillFetchHistory.status == "SUCCESS",
+#             )
+#         )
+#         fetch_result = await db.execute(fetch_query)
+#         bill_fetch_record = fetch_result.scalar_one_or_none()
+
+#         if not bill_fetch_record:
+#             raise HTTPException(
+#                 status_code=400,
+#                 detail={
+#                     "message": "Bill fetch required before payment",
+#                     "error": "This biller requires mandatory bill fetch. Please fetch the bill first using the same reference number.",
+#                     "biller_id": request.biller_id,
+#                     "reference_no": request.reference_no,
+#                     "biller_adhoc": biller_adhoc,
+#                     "fetch_requirement": fetch_requirement,
+#                 }
+#             )
+
+#         logger.info(
+#             f"Bill fetch verified for mandatory fetch biller. "
+#             f"Reference: {request.reference_no}, Fetch ID: {bill_fetch_record.id}"
+#         )
+
+#     # Prepare agent device info as per BBPS documentation
+#     agent_device_info = {
+#         'app': request.agent_device_info.app if request.agent_device_info else 'BBPS_APP',
+#         'imei': request.agent_device_info.imei if request.agent_device_info else '',
+#         'ip': request.agent_device_info.ip if request.agent_device_info else '127.0.0.1',
+#         'initChannel': request.agent_device_info.init_channel if request.agent_device_info else 'INT',
+#         'os': request.agent_device_info.os if request.agent_device_info else 'Android',
+#     }
+
+#     # Prepare customer info
+#     customer_info = {
+#         'customerMobile': request.customer_info.customer_mobile,
+#         'customerEmail': request.customer_info.customer_email or '',
+#     }
+
+#     # Prepare amount info
+#     amount_info = {
+#         'amount': request.amount_info.amount,
+#         'currency': request.amount_info.currency,
+#         'CCF1': request.amount_info.ccf1,
+#         'custConvFee': request.amount_info.cust_conv_fee,
+#         'amountTags': request.amount_info.amount_tags or '',
+#     }
+
+#     # Prepare payment method
+#     payment_method = {
+#         'paymentMode': request.payment_method.payment_mode,
+#         'quickPay': request.payment_method.quick_pay,
+#         'splitPay': request.payment_method.split_pay,
+#     }
+
+#     # Prepare biller response (optional)
+#     biller_response = None
+#     if request.biller_response:
+#         biller_response = {
+#             'billAmount': request.biller_response.bill_amount or '',
+#             'amountOptions': request.biller_response.amount_options or '',
+#         }
+
+#     try:
+#         # Call BBPS API
+#         response_xml = await async_bbps_api_service.pay_bill(
+#             agent_id=settings.AGENT_ID,
+#             agent_device_info=agent_device_info,
+#             customer_info=customer_info,
+#             biller_id=request.biller_id,
+#             biller_adhoc=biller_adhoc,  # From biller configuration
+#             amount_info=amount_info,
+#             input_params=request.input_params,
+#             payment_info=request.payment_info,
+#             payment_method=payment_method,
+#             additional_info=request.additional_info,
+#             isRefIDRequired=request.reference_no  if not biller_adhoc and fetch_requirement.upper() == "MANDATORY" else '',
+#             biller_response=biller_response,
+#         )
+
+#         # Parse response
+#         parsed_response = parse_bill_payment_response(response_xml)
+
+#         # Calculate amount in rupees
+#         amount_rupees = Decimal(request.amount_info.amount) / 100
+
+#         # Determine status
+#         is_success = parsed_response['response_code'] == '000'
+#         status = "SUCCESS" if is_success else "FAILED"
+
+#         # Create transaction record
+#         transaction = BBPSTransactions(
+#             client=request.app_provider,
+#             biller_id=request.biller_id,
+#             biller_name=config.biller_name,
+#             category=config.biller_category,
+#             mobile_number=request.customer_info.customer_mobile,
+#             customer_name=request.customer_name,
+#             amount=amount_rupees,
+#             sent_reference_no=request.reference_no,
+#             txn_reference_no=parsed_response['txn_reference_no'],
+#             approval_reference_no=parsed_response['approval_ref_no'],
+#             status=status,
+#             payment_mode=request.payment_method.payment_mode,
+#             response_xml=response_xml,
+#         )
+#         db.add(transaction)
+#         await db.commit()
+#         await db.refresh(transaction)
+
+#         # If successful, also store in PaidBillHistory for due date tracking
+#         if is_success:
+#             next_due = calculate_next_due_date(
+#                 request.due_date,
+#                 request.billing_cycle_days or 30
+#             )
+
+#             paid_history = PaidBillHistory(
+#                 app_provider=request.app_provider,
+#                 paid_by_user=request.paid_by_user,
+#                 biller_id=request.biller_id,
+#                 biller_name=config.biller_name,
+#                 biller_category=config.biller_category,
+#                 customer_mobile=request.customer_info.customer_mobile,
+#                 customer_name=request.customer_name,
+#                 customer_email=request.customer_info.customer_email,
+#                 input_params_json=request.input_params,
+#                 bill_amount=amount_rupees,
+#                 bill_number=request.bill_number,
+#                 bill_period=request.bill_period,
+#                 bill_date=request.bill_date,
+#                 due_date=request.due_date,
+#                 next_due_date=next_due,
+#                 billing_cycle_days=request.billing_cycle_days or 30,
+#                 payment_mode=request.payment_method.payment_mode,
+#                 txn_reference_no=parsed_response['txn_reference_no'],
+#                 approval_ref_no=parsed_response['approval_ref_no'],
+#                 sent_reference_no=request.reference_no,
+#                 status="SUCCESS",
+#                 alert_days_before=request.alert_days_before or 5,
+#                 alert_enabled=True,
+#                 additional_info_json=request.additional_info,
+#             )
+#             db.add(paid_history)
+#             await db.commit()
+
+#         return BillPaymentResponse(
+#             success=is_success,
+#             message=parsed_response['response_reason'] or ('Payment successful' if is_success else 'Payment failed'),
+#             payment_id=transaction.id,
+#             biller_id=request.biller_id,
+#             reference_no=request.reference_no,
+#             response_code=parsed_response['response_code'],
+#             response_reason=parsed_response['response_reason'],
+#             txn_reference_no=parsed_response['txn_reference_no'],
+#             approval_ref_no=parsed_response['approval_ref_no'],
+#             amount_paid=float(amount_rupees),
+#         )
+
+#     except ValueError as e:
+#         # Validation error (e.g., missing payment info fields)
+#         logger.error(f"Validation error during payment: {e}")
+#         raise HTTPException(status_code=400, detail=str(e))
+
+#     except BBPSException as e:
+#         logger.error(f"BBPS error during payment: {e.message}")
+#         raise HTTPException(status_code=e.status_code, detail=e.message)
+
+#     except Exception as e:
+#         logger.error(f"Error during bill payment: {e}", exc_info=True)
+#         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/pay", response_model=BillPaymentResponse)
+async def pay_bill(
+    request: BillPaymentRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Pay bill via BBPS API.
+
+    Requires:
+    - app_provider: Company code (LCR, ODH, etc.)
+    - paid_by_user: User ID making the payment
+    - reference_no: User-supplied reference number
+    - biller_id: Target biller ID
+    - input_params: Biller-specific input parameters (same as bill fetch)
+    - customer_info: Customer mobile and email
+    - amount_info: Amount in paise, currency, CCF details
+    - payment_method: Payment mode (Cash, UPI, etc.)
+    - payment_info: Payment details based on mode (VPA for UPI, IFSC/AccountNo for NetBanking, etc.)
+
+    The request is sent to BBPS API, and both request and response are stored
+    in the database. Successful payments are also stored in PaidBillHistory
+    for due date tracking and alerts.
+    """
+    logger.info(f"Bill payment request from {request.app_provider}/{request.paid_by_user} for biller {request.biller_id}")
+
+    # Validate biller exists and get configuration
+    query = select(BillerConfiguration).where(BillerConfiguration.biller_id == request.biller_id)
+    result = await db.execute(query)
+    config = result.scalar_one_or_none()
+
+    if not config:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Biller not found: {request.biller_id}"
+        )
+
+    # Check if bill fetch is mandatory for this biller
+    # Per BBPS spec: If Fetch is Mandatory, the same Request ID needs to be used in Payment API
+    biller_adhoc = config.biller_adhoc or False
+    fetch_requirement = config.biller_fetch_requirement or ""
+    additional_info_xml = None
+    bill_fetch_record = None
+    additional_info_xml = None
+    biller_response_xml = None
+    bbps_request_id = ''
+
+    if not biller_adhoc and fetch_requirement.upper() == "MANDATORY":
+        # Verify that a successful bill fetch exists with the same reference_no
+        fetch_query = select(BillFetchHistory).where(
+            and_(
+                BillFetchHistory.reference_no == request.reference_no,
+                BillFetchHistory.biller_id == request.biller_id,
+                BillFetchHistory.status == "SUCCESS",
+            )
+        )
+        fetch_result = await db.execute(fetch_query)
+        bill_fetch_record = fetch_result.scalar_one_or_none()
+
+        if not bill_fetch_record:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": "Bill fetch required before payment",
+                    "error": "This biller requires mandatory bill fetch. Please fetch the bill first using the same reference number.",
+                    "biller_id": request.biller_id,
+                    "reference_no": request.reference_no,
+                    "biller_adhoc": biller_adhoc,
+                    "fetch_requirement": fetch_requirement,
+                }
+            )
+
+        logger.info(
+            f"Bill fetch verified for mandatory fetch biller. "
+            f"Reference: {request.reference_no}, Fetch ID: {bill_fetch_record.id}"
+        )
+
+
+        if bill_fetch_record.response_xml:
+            extracted_data = extract_bill_fetch_data(bill_fetch_record.response_xml)
+            additional_info_xml = extracted_data.get('additional_info_xml')
+            biller_response_xml = extracted_data.get('biller_response_xml')
+
+            if additional_info_xml:
+                logger.info(f"Extracted additionalInfo XML from response_xml for bill fetch record: {bill_fetch_record.id}")
+            if biller_response_xml:
+                logger.info(f"Extracted billerResponse XML from response_xml for bill fetch record: {bill_fetch_record.id}")
+        # Use additional_info from bill fetch if not provided in request
+        # # Per BBPS spec: Additional info from bill fetch should be passed in payment
+        # if not request.additional_info and bill_fetch_record.additional_info_json:
+        #     request.additional_info = bill_fetch_record.additional_info_json
+        #     logger.info(f"Using additional_info from bill fetch record: {bill_fetch_record.id}")
+            
+        additional_info_xml = bill_fetch_record.additional_info_xml
+        if additional_info_xml:
+            logger.info(f"Using additional_info_xml from bill fetch record: {bill_fetch_record.id}")
+            
+            
+        
+        # Get BBPS-generated request ID from bill fetch - this MUST be used in payment
+        bbps_request_id = bill_fetch_record.bbps_request_id or ''
+        if bbps_request_id:
+            logger.info(f"Using bbps_request_id from bill fetch: {bbps_request_id}")
+        else:
+            logger.warning(f"No bbps_request_id found in bill fetch record {bill_fetch_record.id}")
+
+        # Also use biller_response from bill fetch if not provided
+        if not request.biller_response and bill_fetch_record.bill_amount:
+            # Create biller_response from bill fetch data
+            request.biller_response = BillerResponse(
+                bill_amount=str(bill_fetch_record.bill_amount) if bill_fetch_record.bill_amount else None,
+                amount_options=bill_fetch_record.amount_options_json.get('amountOptions', '') if bill_fetch_record.amount_options_json else None,
+            )
+            logger.info(f"Using biller_response from bill fetch record: {bill_fetch_record.id}")
+
+        # Use bill details from fetch if not provided in request
+        if not request.due_date and bill_fetch_record.due_date:
+            request.due_date = bill_fetch_record.due_date
+        if not request.bill_number and bill_fetch_record.bill_number:
+            request.bill_number = bill_fetch_record.bill_number
+        if not request.bill_period and bill_fetch_record.bill_period:
+            request.bill_period = bill_fetch_record.bill_period
+        if not request.bill_date and bill_fetch_record.bill_date:
+            request.bill_date = bill_fetch_record.bill_date
+        if not request.customer_name and bill_fetch_record.customer_name:
+            request.customer_name = bill_fetch_record.customer_name
+
+    # Prepare agent device info as per BBPS documentation
+    agent_device_info = {
+        'app': request.agent_device_info.app if request.agent_device_info else 'BBPS_APP',
+        'imei': request.agent_device_info.imei if request.agent_device_info else '',
+        'ip': request.agent_device_info.ip if request.agent_device_info else '127.0.0.1',
+        'initChannel': request.agent_device_info.init_channel if request.agent_device_info else 'INT',
+        'os': request.agent_device_info.os if request.agent_device_info else 'Android',
+    }
+
+    # Prepare customer info
+    customer_info = {
+        'customerMobile': request.customer_info.customer_mobile,
+        'customerEmail': request.customer_info.customer_email or '',
+    }
+
+    # Prepare amount info
+    amount_info = {
+        'amount': request.amount_info.amount,
+        'currency': request.amount_info.currency,
+        'CCF1': request.amount_info.ccf1,
+        'custConvFee': request.amount_info.cust_conv_fee,
+        'amountTags': request.amount_info.amount_tags or '',
+    }
+
+    # Prepare payment method
+    payment_method = {
+        'paymentMode': request.payment_method.payment_mode,
+        'quickPay': request.payment_method.quick_pay,
+        'splitPay': request.payment_method.split_pay,
+    }
+
+    # Prepare biller response (optional)
+    # biller_response = None
+    # if request.biller_response:
+    #     biller_response = {
+    #         'billAmount': request.biller_response.bill_amount or '',
+    #         'amountOptions': request.biller_response.amount_options or '',
+    #     }
+
+    try:
+        # Call BBPS API
+        response_xml = await async_bbps_api_service.pay_bill(
+            agent_id=settings.AGENT_ID,
+            agent_device_info=agent_device_info,
+            customer_info=customer_info,
+            biller_id=request.biller_id,
+            biller_adhoc=biller_adhoc,  # From biller configuration
+            amount_info=amount_info,
+            input_params=request.input_params,
+            payment_info=request.payment_info,
+            payment_method=payment_method,
+            request_id=bbps_request_id, 
+            # additional_info=request.additional_info,
+            additional_info_xml=additional_info_xml,
+            biller_response_xml=biller_response_xml,
+        )
+
+        # Parse response
+        parsed_response = parse_bill_payment_response(response_xml)
+
+        # Calculate amount in rupees
+        amount_rupees = Decimal(request.amount_info.amount) / 100
+
+        # Determine status
+        is_success = parsed_response['response_code'] == '000'
+        status = "SUCCESS" if is_success else "FAILED"
+
+        # Create transaction record
+        transaction = BBPSTransactions(
+            client=request.app_provider,
+            biller_id=request.biller_id,
+            biller_name=config.biller_name,
+            category=config.biller_category,
+            mobile_number=request.customer_info.customer_mobile,
+            customer_name=request.customer_name,
+            amount=amount_rupees,
+            sent_reference_no=request.reference_no,
+            txn_reference_no=parsed_response['txn_reference_no'],
+            approval_reference_no=parsed_response['approval_ref_no'],
+            status=status,
+            payment_mode=request.payment_method.payment_mode,
+            response_xml=response_xml,
+        )
+        db.add(transaction)
+        await db.commit()
+        await db.refresh(transaction)
+
+        # If successful, also store in PaidBillHistory for due date tracking
+        if is_success:
+            next_due = calculate_next_due_date(
+                request.due_date,
+                request.billing_cycle_days or 30
+            )
+
+            paid_history = PaidBillHistory(
+                app_provider=request.app_provider,
+                paid_by_user=request.paid_by_user,
+                biller_id=request.biller_id,
+                biller_name=config.biller_name,
+                biller_category=config.biller_category,
+                customer_mobile=request.customer_info.customer_mobile,
+                customer_name=request.customer_name,
+                customer_email=request.customer_info.customer_email,
+                input_params_json=request.input_params,
+                bill_amount=amount_rupees,
+                bill_number=request.bill_number,
+                bill_period=request.bill_period,
+                bill_date=request.bill_date,
+                due_date=request.due_date,
+                next_due_date=next_due,
+                billing_cycle_days=request.billing_cycle_days or 30,
+                payment_mode=request.payment_method.payment_mode,
+                txn_reference_no=parsed_response['txn_reference_no'],
+                approval_ref_no=parsed_response['approval_ref_no'],
+                sent_reference_no=request.reference_no,
+                status="SUCCESS",
+                alert_days_before=request.alert_days_before or 5,
+                alert_enabled=True,
+                # additional_info_json=request.additional_info,
+                additional_info_json=bill_fetch_record.additional_info_json if bill_fetch_record else None,
+            )
+            db.add(paid_history)
+            await db.commit()
+
+        return BillPaymentResponse(
+            success=is_success,
+            message=parsed_response['response_reason'] or ('Payment successful' if is_success else 'Payment failed'),
+            payment_id=transaction.id,
+            biller_id=request.biller_id,
+            reference_no=request.reference_no,
+            response_code=parsed_response['response_code'],
+            response_reason=parsed_response['response_reason'],
+            txn_reference_no=parsed_response['txn_reference_no'],
+            approval_ref_no=parsed_response['approval_ref_no'],
+            amount_paid=float(amount_rupees),
+        )
+
+    except ValueError as e:
+        # Validation error (e.g., missing payment info fields)
+        logger.error(f"Validation error during payment: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+    except BBPSException as e:
+        logger.error(f"BBPS error during payment: {e.message}")
+        raise HTTPException(status_code=e.status_code, detail=e.message)
+
+    except Exception as e:
+        logger.error(f"Error during bill payment: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+
+
+@router.get("/history")
+async def get_payment_history(
+    app_provider: Optional[str] = None,
+    paid_by_user: Optional[str] = None,
+    biller_id: Optional[str] = None,
+    status: Optional[str] = None,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Get bill payment history with filters.
+
+    Filter by:
+    - app_provider: Filter by app provider code
+    - paid_by_user: Filter by user ID
+    - biller_id: Filter by biller
+    - status: Filter by status (SUCCESS, REFUNDED)
+    """
+    logger.info(f"Getting payment history: app_provider={app_provider}, user={paid_by_user}")
+
+    # Build query
+    query = select(PaidBillHistory)
+    count_query = select(func.count(PaidBillHistory.id))
+
+    if app_provider:
+        query = query.where(PaidBillHistory.app_provider == app_provider)
+        count_query = count_query.where(PaidBillHistory.app_provider == app_provider)
+
+    if paid_by_user:
+        query = query.where(PaidBillHistory.paid_by_user == paid_by_user)
+        count_query = count_query.where(PaidBillHistory.paid_by_user == paid_by_user)
+
+    if biller_id:
+        query = query.where(PaidBillHistory.biller_id == biller_id)
+        count_query = count_query.where(PaidBillHistory.biller_id == biller_id)
+
+    if status:
+        query = query.where(PaidBillHistory.status == status)
+        count_query = count_query.where(PaidBillHistory.status == status)
+
+    # Get total count
+    count_result = await db.execute(count_query)
+    total = count_result.scalar()
+
+    # Get data with pagination
+    query = query.order_by(PaidBillHistory.payment_date.desc()).offset(skip).limit(limit)
+    result = await db.execute(query)
+    records = result.scalars().all()
+
+    return {
+        "success": True,
+        "total": total,
+        "skip": skip,
+        "limit": limit,
+        "data": [
+            {
+                "id": r.id,
+                "app_provider": r.app_provider,
+                "paid_by_user": r.paid_by_user,
+                "biller_id": r.biller_id,
+                "biller_name": r.biller_name,
+                "biller_category": r.biller_category,
+                "customer_mobile": r.customer_mobile,
+                "customer_name": r.customer_name,
+                "bill_amount": float(r.bill_amount) if r.bill_amount else None,
+                "bill_number": r.bill_number,
+                "payment_mode": r.payment_mode,
+                "payment_date": r.payment_date.isoformat() if r.payment_date else None,
+                "txn_reference_no": r.txn_reference_no,
+                "status": r.status,
+                "due_date": r.due_date,
+                "next_due_date": r.next_due_date.isoformat() if r.next_due_date else None,
+            }
+            for r in records
+        ],
+    }
+
+
+@router.get("/history/{payment_id}")
+async def get_payment_detail(
+    payment_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Get detailed payment record by ID.
+
+    Returns complete details including input params and additional info.
+    """
+    query = select(PaidBillHistory).where(PaidBillHistory.id == payment_id)
+    result = await db.execute(query)
+    record = result.scalar_one_or_none()
+
+    if not record:
+        raise HTTPException(status_code=404, detail=f"Payment record not found: {payment_id}")
+
+    return {
+        "success": True,
+        "data": {
+            "id": record.id,
+            "app_provider": record.app_provider,
+            "paid_by_user": record.paid_by_user,
+            "biller_id": record.biller_id,
+            "biller_name": record.biller_name,
+            "biller_category": record.biller_category,
+            "customer_mobile": record.customer_mobile,
+            "customer_name": record.customer_name,
+            "customer_email": record.customer_email,
+            "input_params": record.input_params_json,
+            "bill_amount": float(record.bill_amount) if record.bill_amount else None,
+            "bill_number": record.bill_number,
+            "bill_period": record.bill_period,
+            "bill_date": record.bill_date,
+            "due_date": record.due_date,
+            "next_due_date": record.next_due_date.isoformat() if record.next_due_date else None,
+            "billing_cycle_days": record.billing_cycle_days,
+            "payment_mode": record.payment_mode,
+            "payment_date": record.payment_date.isoformat() if record.payment_date else None,
+            "txn_reference_no": record.txn_reference_no,
+            "approval_ref_no": record.approval_ref_no,
+            "sent_reference_no": record.sent_reference_no,
+            "status": record.status,
+            "alert_days_before": record.alert_days_before,
+            "alert_enabled": record.alert_enabled,
+            "last_alert_sent": record.last_alert_sent.isoformat() if record.last_alert_sent else None,
+            "additional_info": record.additional_info_json,
+            "created_at": record.created_at.isoformat() if record.created_at else None,
+        },
+    }
+
+
+@router.get("/upcoming-dues", response_model=UpcomingDueResponse)
+async def get_upcoming_dues(
+    app_provider: str = Query(..., description="App provider code"),
+    paid_by_user: Optional[str] = Query(None, description="Filter by user ID"),
+    days_ahead: int = Query(7, ge=1, le=90, description="Look ahead days for upcoming dues"),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Get upcoming bill dues for alerts.
+
+    Returns bills with next due date within the specified days ahead.
+    Use this endpoint to show alerts for upcoming bills.
+
+    Query params:
+    - app_provider: Required - Filter by app provider
+    - paid_by_user: Optional - Filter by specific user
+    - days_ahead: How many days to look ahead (default 7, max 90)
+    """
+    logger.info(f"Getting upcoming dues for {app_provider}, days_ahead={days_ahead}")
+
+    # Calculate date range
+    now = datetime.now()
+    future_date = now + timedelta(days=days_ahead)
+
+    # Build query
+    query = select(PaidBillHistory).where(
+        and_(
+            PaidBillHistory.app_provider == app_provider,
+            PaidBillHistory.alert_enabled == True,
+            PaidBillHistory.next_due_date.isnot(None),
+            PaidBillHistory.next_due_date <= future_date,
+            PaidBillHistory.next_due_date >= now,
+        )
+    )
+    count_query = select(func.count(PaidBillHistory.id)).where(
+        and_(
+            PaidBillHistory.app_provider == app_provider,
+            PaidBillHistory.alert_enabled == True,
+            PaidBillHistory.next_due_date.isnot(None),
+            PaidBillHistory.next_due_date <= future_date,
+            PaidBillHistory.next_due_date >= now,
+        )
+    )
+
+    if paid_by_user:
+        query = query.where(PaidBillHistory.paid_by_user == paid_by_user)
+        count_query = count_query.where(PaidBillHistory.paid_by_user == paid_by_user)
+
+    # Get total count
+    count_result = await db.execute(count_query)
+    total = count_result.scalar()
+
+    # Get data with pagination, ordered by due date
+    query = query.order_by(PaidBillHistory.next_due_date.asc()).offset(skip).limit(limit)
+    result = await db.execute(query)
+    records = result.scalars().all()
+
+    return UpcomingDueResponse(
+        success=True,
+        total=total,
+        data=[
+            {
+                "id": r.id,
+                "app_provider": r.app_provider,
+                "paid_by_user": r.paid_by_user,
+                "biller_id": r.biller_id,
+                "biller_name": r.biller_name,
+                "biller_category": r.biller_category,
+                "customer_mobile": r.customer_mobile,
+                "customer_name": r.customer_name,
+                "bill_amount": float(r.bill_amount) if r.bill_amount else None,
+                "next_due_date": r.next_due_date.isoformat() if r.next_due_date else None,
+                "days_until_due": (r.next_due_date - now).days if r.next_due_date else None,
+                "last_payment_date": r.payment_date.isoformat() if r.payment_date else None,
+                "input_params": r.input_params_json,
+            }
+            for r in records
+        ],
+    )
+
+
+@router.patch("/alert-settings/{payment_id}")
+async def update_alert_settings(
+    payment_id: int,
+    alert_enabled: Optional[bool] = Query(None, description="Enable/disable alerts"),
+    alert_days_before: Optional[int] = Query(None, ge=1, le=30, description="Days before due to alert"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Update alert settings for a paid bill.
+
+    Allows enabling/disabling alerts and changing the alert days before due date.
+    """
+    query = select(PaidBillHistory).where(PaidBillHistory.id == payment_id)
+    result = await db.execute(query)
+    record = result.scalar_one_or_none()
+
+    if not record:
+        raise HTTPException(status_code=404, detail=f"Payment record not found: {payment_id}")
+
+    if alert_enabled is not None:
+        record.alert_enabled = alert_enabled
+
+    if alert_days_before is not None:
+        record.alert_days_before = alert_days_before
+
+    await db.commit()
+
+    return {
+        "success": True,
+        "message": "Alert settings updated",
+        "data": {
+            "id": record.id,
+            "alert_enabled": record.alert_enabled,
+            "alert_days_before": record.alert_days_before,
+        },
+    }
+
+
+@router.get("/user-bills/{user_id}")
+async def get_user_paid_bills(
+    user_id: str,
+    app_provider: str = Query(..., description="App provider code"),
+    biller_category: Optional[str] = Query(None, description="Filter by biller category"),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Get all paid bills for a specific user.
+
+    Returns a list of unique billers the user has paid, with their most recent payment.
+    Useful for showing user's registered/saved billers.
+    """
+    logger.info(f"Getting paid bills for user {user_id} from {app_provider}")
+
+    # Build query to get latest payment for each biller
+    query = select(PaidBillHistory).where(
+        and_(
+            PaidBillHistory.app_provider == app_provider,
+            PaidBillHistory.paid_by_user == user_id,
+        )
+    )
+
+    if biller_category:
+        query = query.where(PaidBillHistory.biller_category == biller_category)
+
+    # Get data ordered by most recent payment
+    query = query.order_by(PaidBillHistory.payment_date.desc()).offset(skip).limit(limit)
+    result = await db.execute(query)
+    records = result.scalars().all()
+
+    # Group by biller to get unique billers with latest payment
+    seen_billers = {}
+    for r in records:
+        key = (r.biller_id, r.customer_mobile)
+        if key not in seen_billers:
+            seen_billers[key] = {
+                "id": r.id,
+                "biller_id": r.biller_id,
+                "biller_name": r.biller_name,
+                "biller_category": r.biller_category,
+                "customer_mobile": r.customer_mobile,
+                "customer_name": r.customer_name,
+                "input_params": r.input_params_json,
+                "last_bill_amount": float(r.bill_amount) if r.bill_amount else None,
+                "last_payment_date": r.payment_date.isoformat() if r.payment_date else None,
+                "next_due_date": r.next_due_date.isoformat() if r.next_due_date else None,
+                "alert_enabled": r.alert_enabled,
+            }
+
+    return {
+        "success": True,
+        "total": len(seen_billers),
+        "data": list(seen_billers.values()),
+    }

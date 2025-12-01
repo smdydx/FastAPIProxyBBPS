@@ -1,0 +1,1781 @@
+"""
+Optimized async MDM (Master Data Management) API endpoints.
+Uses async PostgreSQL, caching, and optimized queries.
+"""
+
+import logging
+from typing import List, Optional
+import xml.etree.ElementTree as ET
+from io import BytesIO
+
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, func
+from pydantic import BaseModel
+
+from app.core.database import get_db
+from app.core.cache import cached, cache
+from app.models.optimized_models import (
+    Biller,
+    BillerMDM,
+    BillerConfiguration,
+)
+from app.services.bbps_api_service_async import async_bbps_api_service
+from app.exceptions import BBPSException
+from app.utils.utils import xml_to_dict, parse_xml
+from app.core.auth import get_current_client
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/mdm", tags=["MDM - Optimized"],
+dependencies=[Depends(get_current_client)])
+
+
+# Request schemas
+class SingleBillerMDMRequest(BaseModel):
+    """Request schema for single biller MDM."""
+    biller_id: str
+
+
+class MultipleBillerMDMRequest(BaseModel):
+    """Request schema for multiple billers MDM."""
+    biller_ids: List[str]
+
+
+class CategoryMDMRequest(BaseModel):
+    """Request schema for category-wise MDM update."""
+    category: str
+
+
+@router.post("/fetch/single")
+async def fetch_single_biller_mdm(
+    request: SingleBillerMDMRequest,
+    db: AsyncSession = Depends(get_db),
+    store_in_db: bool = True,
+):
+    """
+    Fetch MDM for a single biller from BBPS API (async optimized).
+
+    Performance:
+    - Async HTTP request to BBPS API
+    - Optimized database upsert
+    - Response caching support
+    """
+    logger.info(f"Fetching MDM for biller: {request.biller_id}")
+    try:
+        # Async fetch from BBPS API
+        response = await async_bbps_api_service.get_biller_mdm([request.biller_id])
+
+        if not response:
+            raise HTTPException(status_code=500, detail="Failed to fetch MDM from BBPS API")
+
+        # Parse response
+        root = ET.fromstring(response)
+        response_code = root.find("responseCode")
+
+        if response_code is None or response_code.text != "000":
+            error_msg = "Invalid response from BBPS API"
+            if response_code is not None:
+                error_msg = f"BBPS API returned code: {response_code.text}"
+            raise HTTPException(status_code=400, detail=error_msg)
+
+        # Extract biller data
+        biller_element = root.find("biller")
+        if biller_element is None:
+            raise HTTPException(status_code=404, detail="Biller not found in BBPS response")
+
+        blr_id = biller_element.find("billerId").text
+        category = biller_element.find("billerCategory").text
+        mdm_xml = ET.tostring(biller_element, encoding='utf-8').decode('utf-8')
+
+        # Store in database if requested
+        if store_in_db:
+            await _store_mdm_async(db, blr_id, category, mdm_xml)
+            # Invalidate cache
+            await cache.delete(f"biller_mdm:{blr_id}")
+
+        return {
+            "success": True,
+            "biller_id": blr_id,
+            "category": category,
+            "data": xml_to_dict(biller_element),
+            "stored_in_db": store_in_db
+        }
+
+    except BBPSException as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching MDM: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/fetch/multiple")
+async def fetch_multiple_billers_mdm(
+    request: MultipleBillerMDMRequest,
+    db: AsyncSession = Depends(get_db),
+    store_in_db: bool = True,
+):
+    """
+    Fetch MDM for multiple billers from BBPS API (async optimized).
+
+    Performance:
+    - Single async HTTP request for multiple billers
+    - Batch database upsert
+    - Bulk cache invalidation
+    """
+    logger.info(f"Fetching MDM for {len(request.biller_ids)} billers")
+    try:
+        # Async fetch from BBPS API
+        response = await async_bbps_api_service.get_biller_mdm(request.biller_ids)
+
+        if not response:
+            raise HTTPException(status_code=500, detail="Failed to fetch MDM from BBPS API")
+
+        # Parse response
+        root = ET.fromstring(response)
+        response_code = root.find("responseCode")
+
+        if response_code is None or response_code.text != "000":
+            error_msg = "Invalid response from BBPS API"
+            if response_code is not None:
+                error_msg = f"BBPS API returned code: {response_code.text}"
+            raise HTTPException(status_code=400, detail=error_msg)
+
+        # Extract all billers
+        billers_data = root.findall("biller")
+        results = []
+        stored_ids = []
+
+        for biller_element in billers_data:
+            blr_id = biller_element.find("billerId").text
+            category = biller_element.find("billerCategory").text
+            mdm_xml = ET.tostring(biller_element, encoding='utf-8').decode('utf-8')
+
+            # Store in database if requested
+            if store_in_db:
+                await _store_mdm_async(db, blr_id, category, mdm_xml)
+                stored_ids.append(blr_id)
+
+            results.append({
+                "biller_id": blr_id,
+                "category": category,
+                "status": "success"
+            })
+
+        # Bulk cache invalidation
+        if stored_ids:
+            for blr_id in stored_ids:
+                await cache.delete(f"biller_mdm:{blr_id}")
+
+        return {
+            "success": True,
+            "total_requested": len(request.biller_ids),
+            "total_fetched": len(results),
+            "stored_in_db": len(stored_ids) if store_in_db else 0,
+            "results": results
+        }
+
+    except BBPSException as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching MDM for multiple billers: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/fetch/by-category")
+async def fetch_mdm_by_category(
+    request: CategoryMDMRequest,
+    db: AsyncSession = Depends(get_db),
+    store_in_db: bool = True,
+    batch_size: int = Query(50, ge=10, le=100),
+):
+    """
+    Fetch MDM for all billers in a category (async optimized with batching).
+
+    Performance:
+    - Async database query for billers
+    - Batched async HTTP requests
+    - Parallel processing where possible
+    """
+    logger.info(f"Fetching MDM for category: {request.category}")
+    try:
+        # Async get all billers in category
+        query = select(Biller.blr_id).where(Biller.blr_category_name == request.category)
+        result = await db.execute(query)
+        biller_ids = [row[0] for row in result.all()]
+
+        if not biller_ids:
+            raise HTTPException(status_code=404, detail=f"No billers found for category: {request.category}")
+
+        total_billers = len(biller_ids)
+        total_stored = 0
+        all_results = []
+        failed_billers = []
+
+        # Process in batches
+        for i in range(0, total_billers, batch_size):
+            batch = biller_ids[i:i + batch_size]
+            batch_num = i // batch_size + 1
+            logger.info(f"Processing batch {batch_num}: {len(batch)} billers")
+
+            try:
+                response = await async_bbps_api_service.get_biller_mdm(batch)
+
+                if response:
+                    root = ET.fromstring(response)
+                    response_code = root.find("responseCode")
+
+                    if response_code is not None and response_code.text == "000":
+                        billers_data = root.findall("biller")
+
+                        for biller_element in billers_data:
+                            blr_id = biller_element.find("billerId").text
+                            category = biller_element.find("billerCategory").text
+                            mdm_xml = ET.tostring(biller_element, encoding='utf-8').decode('utf-8')
+
+                            if store_in_db:
+                                await _store_mdm_async(db, blr_id, category, mdm_xml)
+                                total_stored += 1
+
+                            all_results.append({
+                                "biller_id": blr_id,
+                                "category": category,
+                                "status": "success"
+                            })
+                    else:
+                        failed_billers.extend(batch)
+                else:
+                    failed_billers.extend(batch)
+
+            except Exception as e:
+                logger.error(f"Error processing batch {batch_num}: {e}")
+                failed_billers.extend(batch)
+
+        return {
+            "success": True,
+            "category": request.category,
+            "total_billers": total_billers,
+            "total_fetched": len(all_results),
+            "stored_in_db": total_stored if store_in_db else 0,
+            "failed_count": len(failed_billers),
+            "results": all_results
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching MDM by category: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/fetch/from-excel")
+async def fetch_mdm_from_excel(
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+    store_in_db: bool = True,
+    batch_size: int = Query(50, ge=10, le=100),
+    biller_id_column: str = Query("blr_id"),
+):
+    """
+    Fetch MDM for all billers from Excel file (async optimized).
+
+    Performance:
+    - Async file reading
+    - Batched async HTTP requests
+    - Progress tracking
+    """
+    import pandas as pd
+
+    logger.info(f"Fetching MDM from Excel file: {file.filename}")
+
+    if not file.filename.endswith(('.xlsx', '.xls')):
+        raise HTTPException(status_code=400, detail="File must be an Excel file (.xlsx or .xls)")
+
+    try:
+        # Read Excel file
+        contents = await file.read()
+        df = pd.read_excel(BytesIO(contents))
+
+        if biller_id_column not in df.columns:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Column '{biller_id_column}' not found. Available: {list(df.columns)}"
+            )
+
+        biller_ids = df[biller_id_column].dropna().astype(str).tolist()
+        total_billers = len(biller_ids)
+
+        if total_billers == 0:
+            raise HTTPException(status_code=400, detail="No biller IDs found in Excel file")
+
+        total_stored = 0
+        total_fetched = 0
+        failed_billers = []
+
+        # Process in batches
+        for i in range(0, total_billers, batch_size):
+            batch = biller_ids[i:i + batch_size]
+            batch_num = i // batch_size + 1
+            logger.info(f"Processing batch {batch_num}/{(total_billers + batch_size - 1) // batch_size}")
+
+            try:
+                response = await async_bbps_api_service.get_biller_mdm(batch)
+
+                if response:
+                    root = ET.fromstring(response)
+                    response_code = root.find("responseCode")
+
+                    if response_code is not None and response_code.text == "000":
+                        billers_data = root.findall("biller")
+
+                        for biller_element in billers_data:
+                            blr_id = biller_element.find("billerId").text
+                            category = biller_element.find("billerCategory").text
+                            mdm_xml = ET.tostring(biller_element, encoding='utf-8').decode('utf-8')
+
+                            if store_in_db:
+                                await _store_mdm_async(db, blr_id, category, mdm_xml)
+                                total_stored += 1
+
+                            total_fetched += 1
+                    else:
+                        failed_billers.extend(batch)
+                else:
+                    failed_billers.extend(batch)
+
+            except Exception as e:
+                logger.error(f"Error processing batch {batch_num}: {e}")
+                failed_billers.extend(batch)
+
+        return {
+            "success": True,
+            "filename": file.filename,
+            "total_billers_in_file": total_billers,
+            "total_fetched": total_fetched,
+            "stored_in_db": total_stored if store_in_db else 0,
+            "failed_count": len(failed_billers),
+            "failed_billers": failed_billers[:50] if failed_billers else []
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error processing Excel file: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/stored/{biller_id}")
+@cached(key_prefix="mdm_stored", expire=3600)
+async def get_stored_mdm(
+    biller_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Get stored MDM for a biller (async with caching).
+
+    Performance:
+    - Cached for 1 hour
+    - Index lookup on blr_id
+    """
+    logger.info(f"Getting stored MDM for biller: {biller_id}")
+    try:
+        query = select(BillerMDM).where(BillerMDM.blr_id == biller_id)
+        result = await db.execute(query)
+        mdm_entry = result.scalar_one_or_none()
+
+        if not mdm_entry:
+            raise HTTPException(status_code=404, detail=f"MDM not found for biller: {biller_id}")
+
+        return {
+            "success": True,
+            "biller_id": mdm_entry.blr_id,
+            "category": mdm_entry.category,
+            "data": xml_to_dict(parse_xml(mdm_entry.mdm_xml)),
+            "created_at": mdm_entry.created_at.isoformat() if mdm_entry.created_at else None,
+            "updated_at": mdm_entry.updated_at.isoformat() if mdm_entry.updated_at else None
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting stored MDM: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/stored/by-category/{category}")
+@cached(key_prefix="mdm_by_category", expire=300)
+async def get_stored_mdm_by_category(
+    category: str,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Get stored MDM entries for a category (async with pagination).
+
+    Performance:
+    - Cached for 5 minutes
+    - Uses index on category
+    - Optimized pagination
+    """
+    logger.info(f"Getting stored MDM for category: {category}")
+    try:
+        # Count query
+        count_query = select(func.count(BillerMDM.id)).where(BillerMDM.category == category)
+        count_result = await db.execute(count_query)
+        total = count_result.scalar()
+
+        # Data query with pagination
+        query = (
+            select(BillerMDM)
+            .where(BillerMDM.category == category)
+            .order_by(BillerMDM.blr_id)
+            .offset(skip)
+            .limit(limit)
+        )
+        result = await db.execute(query)
+        mdm_entries = result.scalars().all()
+
+        return {
+            "success": True,
+            "category": category,
+            "total": total,
+            "skip": skip,
+            "limit": limit,
+            "data": [
+                {
+                    "biller_id": entry.blr_id,
+                    "category": entry.category,
+                    "updated_at": entry.updated_at.isoformat() if entry.updated_at else None
+                }
+                for entry in mdm_entries
+            ]
+        }
+
+    except Exception as e:
+        logger.error(f"Error getting stored MDM by category: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/stats")
+@cached(key_prefix="mdm_stats", expire=300)
+async def get_mdm_stats(db: AsyncSession = Depends(get_db)):
+    """
+    Get MDM statistics (async with aggregations).
+
+    Performance:
+    - Cached for 5 minutes
+    - Uses optimized COUNT queries
+    """
+    logger.info("Getting MDM statistics")
+
+    # Total MDM entries
+    total_query = select(func.count(BillerMDM.id))
+    total_result = await db.execute(total_query)
+    total = total_result.scalar()
+
+    # MDM by category
+    category_query = (
+        select(BillerMDM.category, func.count(BillerMDM.id).label("count"))
+        .group_by(BillerMDM.category)
+        .order_by(func.count(BillerMDM.id).desc())
+    )
+    category_result = await db.execute(category_query)
+    categories = category_result.all()
+
+    return {
+        "total_mdm_entries": total,
+        "by_category": [
+            {"category": cat, "count": count}
+            for cat, count in categories
+        ]
+    }
+
+
+async def _store_mdm_async(
+    db: AsyncSession,
+    blr_id: str,
+    category: str,
+    mdm_xml: str
+) -> None:
+    """Store or update MDM data in database (async optimized)."""
+    try:
+        # Check if exists
+        query = select(BillerMDM).where(BillerMDM.blr_id == blr_id)
+        result = await db.execute(query)
+        mdm_entry = result.scalar_one_or_none()
+
+        if mdm_entry:
+            mdm_entry.category = category
+            mdm_entry.mdm_xml = mdm_xml
+        else:
+            mdm_entry = BillerMDM(
+                blr_id=blr_id,
+                category=category,
+                mdm_xml=mdm_xml
+            )
+            db.add(mdm_entry)
+
+        await db.commit()
+        logger.debug(f"MDM stored for biller: {blr_id}")
+
+        # Also store biller configuration
+        biller_element = ET.fromstring(mdm_xml)
+        await _store_biller_configuration_async(db, biller_element)
+
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"Error storing MDM for biller {blr_id}: {e}")
+        raise
+
+
+def _parse_biller_configuration(biller_element: ET.Element) -> dict:
+    """
+    Parse biller configuration from MDM XML element.
+    Extracts all fields as per BBPS API Integration Document pages 13-16.
+    """
+    def get_text(elem, tag, default=None):
+        """Get text from child element."""
+        child = elem.find(tag)
+        return child.text if child is not None and child.text else default
+
+    def get_bool(elem, tag):
+        """Get boolean from child element."""
+        text = get_text(elem, tag)
+        if text is None:
+            return None
+        return text.lower() in ('true', 'yes', '1')
+
+    def get_int(elem, tag):
+        """Get integer from child element."""
+        text = get_text(elem, tag)
+        if text is None:
+            return None
+        try:
+            return int(text)
+        except ValueError:
+            return None
+
+    # Parse basic biller info
+    config = {
+        'biller_id': get_text(biller_element, 'billerId'),
+        'biller_name': get_text(biller_element, 'billerName'),
+        'biller_category': get_text(biller_element, 'billerCategory'),
+        'biller_adhoc': get_bool(biller_element, 'billerAdhoc'),
+        'biller_coverage': get_text(biller_element, 'billerCoverage'),
+        'biller_description': get_text(biller_element, 'billerDescription'),
+        'biller_fetch_requirement': get_text(biller_element, 'billerFetchRequiremet'),
+        'biller_payment_exactness': get_text(biller_element, 'billerPaymentExactness'),
+        'biller_support_bill_validation': get_text(biller_element, 'billerSupportBillValidation'),
+        'support_pending_status': get_bool(biller_element, 'supportPendingStatus'),
+        'support_deemed': get_bool(biller_element, 'supportDeemed'),
+        'biller_timeout': get_int(biller_element, 'billerTimeout'),
+        'biller_amount_options': get_text(biller_element, 'billerAmountOptions'),
+        'recharge_amount_in_validation_request': get_text(biller_element, 'rechargeAmountInValidationRequest'),
+        'plan_mdm_requirement': get_text(biller_element, 'planMdmRequirement'),
+    }
+
+    # Parse billerAdditionalInfo
+    additional_info_elem = biller_element.find('billerAdditionalInfo')
+    if additional_info_elem is not None:
+        config['biller_additional_info'] = xml_to_dict(additional_info_elem)
+
+    # Parse billerAdditionalInfoPayment
+    additional_info_payment_elem = biller_element.find('billerAdditionalInfoPayment')
+    if additional_info_payment_elem is not None:
+        config['biller_additional_info_payment'] = xml_to_dict(additional_info_payment_elem)
+
+    # Parse planAdditionalInfo
+    plan_additional_info_elem = biller_element.find('planAdditionalInfo')
+    if plan_additional_info_elem is not None:
+        config['plan_additional_info'] = xml_to_dict(plan_additional_info_elem)
+
+    # Store raw XML for billerInputParams
+    input_params_elem = biller_element.find('billerInputParams')
+    if input_params_elem is not None and len(input_params_elem) > 0:
+        config['biller_input_params_xml'] = ET.tostring(input_params_elem, encoding='unicode')
+    else:
+        config['biller_input_params_xml'] = None
+
+    # Store raw XML for billerPaymentChannels
+    payment_channels_elem = biller_element.find('billerPaymentChannels')
+    if payment_channels_elem is not None and len(payment_channels_elem) > 0:
+        config['biller_payment_channels_xml'] = ET.tostring(payment_channels_elem, encoding='unicode')
+    else:
+        config['biller_payment_channels_xml'] = None
+
+    # Store raw XML for billerPaymentModes
+    payment_modes_elem = biller_element.find('billerPaymentModes')
+    if payment_modes_elem is not None and len(payment_modes_elem) > 0:
+        config['biller_payment_modes_xml'] = ET.tostring(payment_modes_elem, encoding='unicode')
+    else:
+        config['biller_payment_modes_xml'] = None
+
+    return config
+
+
+async def _store_biller_configuration_async(
+    db: AsyncSession,
+    biller_element: ET.Element
+) -> None:
+    """Store or update biller configuration from MDM XML element."""
+    try:
+        # Parse configuration from XML
+        config = _parse_biller_configuration(biller_element)
+        biller_id = config.get('biller_id')
+
+        if not biller_id:
+            logger.warning("No biller_id found in MDM XML, skipping configuration storage")
+            return
+
+        # Check if exists
+        query = select(BillerConfiguration).where(BillerConfiguration.biller_id == biller_id)
+        result = await db.execute(query)
+        config_entry = result.scalar_one_or_none()
+
+        if config_entry:
+            # Update existing configuration
+            config_entry.biller_name = config.get('biller_name')
+            config_entry.biller_category = config.get('biller_category')
+            config_entry.biller_adhoc = config.get('biller_adhoc')
+            config_entry.biller_coverage = config.get('biller_coverage')
+            config_entry.biller_description = config.get('biller_description')
+            config_entry.biller_fetch_requirement = config.get('biller_fetch_requirement')
+            config_entry.biller_payment_exactness = config.get('biller_payment_exactness')
+            config_entry.biller_support_bill_validation = config.get('biller_support_bill_validation')
+            config_entry.support_pending_status = config.get('support_pending_status')
+            config_entry.support_deemed = config.get('support_deemed')
+            config_entry.biller_timeout = config.get('biller_timeout')
+            config_entry.biller_amount_options = config.get('biller_amount_options')
+            config_entry.recharge_amount_in_validation_request = config.get('recharge_amount_in_validation_request')
+            config_entry.plan_mdm_requirement = config.get('plan_mdm_requirement')
+            config_entry.biller_additional_info = config.get('biller_additional_info')
+            config_entry.biller_additional_info_payment = config.get('biller_additional_info_payment')
+            config_entry.plan_additional_info = config.get('plan_additional_info')
+            # Store XML for nested structures
+            config_entry.biller_input_params_xml = config.get('biller_input_params_xml')
+            config_entry.biller_payment_channels_xml = config.get('biller_payment_channels_xml')
+            config_entry.biller_payment_modes_xml = config.get('biller_payment_modes_xml')
+        else:
+            # Create new configuration
+            config_entry = BillerConfiguration(
+                biller_id=biller_id,
+                biller_name=config.get('biller_name'),
+                biller_category=config.get('biller_category'),
+                biller_adhoc=config.get('biller_adhoc'),
+                biller_coverage=config.get('biller_coverage'),
+                biller_description=config.get('biller_description'),
+                biller_fetch_requirement=config.get('biller_fetch_requirement'),
+                biller_payment_exactness=config.get('biller_payment_exactness'),
+                biller_support_bill_validation=config.get('biller_support_bill_validation'),
+                support_pending_status=config.get('support_pending_status'),
+                support_deemed=config.get('support_deemed'),
+                biller_timeout=config.get('biller_timeout'),
+                biller_amount_options=config.get('biller_amount_options'),
+                recharge_amount_in_validation_request=config.get('recharge_amount_in_validation_request'),
+                plan_mdm_requirement=config.get('plan_mdm_requirement'),
+                biller_additional_info=config.get('biller_additional_info'),
+                biller_additional_info_payment=config.get('biller_additional_info_payment'),
+                plan_additional_info=config.get('plan_additional_info'),
+                # Store XML for nested structures
+                biller_input_params_xml=config.get('biller_input_params_xml'),
+                biller_payment_channels_xml=config.get('biller_payment_channels_xml'),
+                biller_payment_modes_xml=config.get('biller_payment_modes_xml'),
+            )
+            db.add(config_entry)
+
+        await db.commit()
+        logger.info(f"Biller configuration stored for biller: {biller_id}")
+
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"Error storing biller configuration: {e}")
+        raise
+
+
+@router.get("/configuration/{biller_id}")
+async def get_biller_configuration(
+    biller_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Get stored biller configuration with all related data.
+    Returns input params, payment channels, and payment modes as XML or parsed dict.
+    """
+    logger.info(f"Getting biller configuration for: {biller_id}")
+    try:
+        # Get configuration
+        query = select(BillerConfiguration).where(BillerConfiguration.biller_id == biller_id)
+        result = await db.execute(query)
+        config = result.scalar_one_or_none()
+
+        if not config:
+            raise HTTPException(status_code=404, detail=f"Configuration not found for biller: {biller_id}")
+
+        # Parse XML fields to dict for response
+        input_params_data = None
+        if config.biller_input_params_xml:
+            try:
+                input_params_elem = ET.fromstring(config.biller_input_params_xml)
+                input_params_data = xml_to_dict(input_params_elem)
+            except Exception:
+                input_params_data = config.biller_input_params_xml
+
+        payment_channels_data = None
+        if config.biller_payment_channels_xml:
+            try:
+                payment_channels_elem = ET.fromstring(config.biller_payment_channels_xml)
+                payment_channels_data = xml_to_dict(payment_channels_elem)
+            except Exception:
+                payment_channels_data = config.biller_payment_channels_xml
+
+        payment_modes_data = None
+        if config.biller_payment_modes_xml:
+            try:
+                payment_modes_elem = ET.fromstring(config.biller_payment_modes_xml)
+                payment_modes_data = xml_to_dict(payment_modes_elem)
+            except Exception:
+                payment_modes_data = config.biller_payment_modes_xml
+
+        return {
+            "success": True,
+            "biller_id": config.biller_id,
+            "configuration": {
+                "biller_name": config.biller_name,
+                "biller_category": config.biller_category,
+                "biller_adhoc": config.biller_adhoc,
+                "biller_coverage": config.biller_coverage,
+                "biller_description": config.biller_description,
+                "biller_fetch_requirement": config.biller_fetch_requirement,
+                "biller_payment_exactness": config.biller_payment_exactness,
+                "biller_support_bill_validation": config.biller_support_bill_validation,
+                "support_pending_status": config.support_pending_status,
+                "support_deemed": config.support_deemed,
+                "biller_timeout": config.biller_timeout,
+                "biller_amount_options": config.biller_amount_options,
+                "recharge_amount_in_validation_request": config.recharge_amount_in_validation_request,
+                "plan_mdm_requirement": config.plan_mdm_requirement,
+                "biller_additional_info": config.biller_additional_info,
+                "biller_additional_info_payment": config.biller_additional_info_payment,
+                "plan_additional_info": config.plan_additional_info,
+                "created_at": config.created_at.isoformat() if config.created_at else None,
+                "updated_at": config.updated_at.isoformat() if config.updated_at else None,
+            },
+            "input_params": input_params_data,
+            "payment_channels": payment_channels_data,
+            "payment_modes": payment_modes_data,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting biller configuration: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/configurations")
+async def list_biller_configurations(
+    category: Optional[str] = None,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    List all stored biller configurations with pagination.
+    Optionally filter by category.
+    """
+    logger.info(f"Listing biller configurations, category={category}, skip={skip}, limit={limit}")
+    try:
+        # Build query
+        query = select(BillerConfiguration)
+        count_query = select(func.count(BillerConfiguration.id))
+
+        if category:
+            query = query.where(BillerConfiguration.biller_category == category)
+            count_query = count_query.where(BillerConfiguration.biller_category == category)
+
+        # Get total count
+        count_result = await db.execute(count_query)
+        total = count_result.scalar()
+
+        # Get configurations
+        query = query.order_by(BillerConfiguration.biller_id).offset(skip).limit(limit)
+        result = await db.execute(query)
+        configurations = result.scalars().all()
+
+        return {
+            "success": True,
+            "total": total,
+            "skip": skip,
+            "limit": limit,
+            "category_filter": category,
+            "data": [
+                {
+                    "biller_id": c.biller_id,
+                    "biller_name": c.biller_name,
+                    "biller_category": c.biller_category,
+                    "biller_coverage": c.biller_coverage,
+                    "biller_fetch_requirement": c.biller_fetch_requirement,
+                    "biller_adhoc": c.biller_adhoc,
+                    "updated_at": c.updated_at.isoformat() if c.updated_at else None,
+                }
+                for c in configurations
+            ],
+        }
+
+    except Exception as e:
+        logger.error(f"Error listing biller configurations: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+
+
+
+
+
+# """
+# Optimized async MDM (Master Data Management) API endpoints.
+# Uses async PostgreSQL, caching, and optimized queries.
+# """
+
+# import logging
+# from typing import List, Optional
+# import xml.etree.ElementTree as ET
+# from io import BytesIO
+
+# from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
+# from sqlalchemy.ext.asyncio import AsyncSession
+# from sqlalchemy import select, func, delete
+# from pydantic import BaseModel
+
+# from app.core.database import get_db
+# from app.core.cache import cached, cache
+# from app.models.optimized_models import (
+#     Biller,
+#     BillerMDM,
+#     BillerConfiguration,
+#     BillerInputParam,
+#     BillerPaymentChannel,
+#     BillerPaymentMode
+# )
+# from app.services.bbps_api_service_async import async_bbps_api_service
+# from app.exceptions import BBPSException
+# from app.utils.utils import xml_to_dict, parse_xml
+# from app.schemas.biller_schemas import BillerConfigurationResponse, BillerInputParamSchema, BillerPaymentChannelSchema, BillerPaymentModeSchema
+
+# logger = logging.getLogger(__name__)
+
+# router = APIRouter(prefix="/mdm", tags=["MDM - Optimized"])
+
+
+# # Request schemas
+# class SingleBillerMDMRequest(BaseModel):
+#     """Request schema for single biller MDM."""
+#     biller_id: str
+
+
+# class MultipleBillerMDMRequest(BaseModel):
+#     """Request schema for multiple billers MDM."""
+#     biller_ids: List[str]
+
+
+# class CategoryMDMRequest(BaseModel):
+#     """Request schema for category-wise MDM update."""
+#     category: str
+
+
+# @router.post("/fetch/single")
+# async def fetch_single_biller_mdm(
+#     request: SingleBillerMDMRequest,
+#     db: AsyncSession = Depends(get_db),
+#     store_in_db: bool = True,
+# ):
+#     """
+#     Fetch MDM for a single biller from BBPS API (async optimized).
+
+#     Performance:
+#     - Async HTTP request to BBPS API
+#     - Optimized database upsert
+#     - Response caching support
+#     """
+#     logger.info(f"Fetching MDM for biller: {request.biller_id}")
+#     try:
+#         # Async fetch from BBPS API
+#         response = await async_bbps_api_service.get_biller_mdm([request.biller_id])
+
+#         if not response:
+#             raise HTTPException(status_code=500, detail="Failed to fetch MDM from BBPS API")
+
+#         # Parse response
+#         root = ET.fromstring(response)
+#         response_code = root.find("responseCode")
+
+#         if response_code is None or response_code.text != "000":
+#             error_msg = "Invalid response from BBPS API"
+#             if response_code is not None:
+#                 error_msg = f"BBPS API returned code: {response_code.text}"
+#             raise HTTPException(status_code=400, detail=error_msg)
+
+#         # Extract biller data
+#         biller_element = root.find("biller")
+#         if biller_element is None:
+#             raise HTTPException(status_code=404, detail="Biller not found in BBPS response")
+
+#         blr_id = biller_element.find("billerId").text
+#         category = biller_element.find("billerCategory").text
+#         mdm_xml = ET.tostring(biller_element, encoding='utf-8').decode('utf-8')
+
+#         # Store in database if requested
+#         if store_in_db:
+#             print("came to store in db")
+            
+#             try:
+#                 await _store_mdm_async(db, blr_id, category, mdm_xml)
+                
+#             except Exception as e:
+#                 logger.error(f"Error storing MDM for biller {blr_id}: {e}")
+#                 raise HTTPException(status_code=500, detail=f"Error storing MDM for biller {blr_id}: {e}")
+#             # Invalidate cache
+#             await cache.delete(f"biller_mdm:{blr_id}")
+
+#         return {
+#             "success": True,
+#             "biller_id": blr_id,
+#             "category": category,
+#             "data": xml_to_dict(biller_element),
+#             "stored_in_db": store_in_db
+#         }
+
+#     except BBPSException as e:
+#         raise HTTPException(status_code=e.status_code, detail=e.message)
+#     except HTTPException:
+#         raise
+#     except Exception as e:
+#         logger.error(f"Error fetching MDM: {e}", exc_info=True)
+#         raise HTTPException(status_code=500, detail=str(e))
+
+
+# @router.post("/fetch/multiple")
+# async def fetch_multiple_billers_mdm(
+#     request: MultipleBillerMDMRequest,
+#     db: AsyncSession = Depends(get_db),
+#     store_in_db: bool = True,
+# ):
+#     """
+#     Fetch MDM for multiple billers from BBPS API (async optimized).
+
+#     Performance:
+#     - Single async HTTP request for multiple billers
+#     - Batch database upsert
+#     - Bulk cache invalidation
+#     """
+#     logger.info(f"Fetching MDM for {len(request.biller_ids)} billers")
+#     try:
+#         # Async fetch from BBPS API
+#         response = await async_bbps_api_service.get_biller_mdm(request.biller_ids)
+
+#         if not response:
+#             raise HTTPException(status_code=500, detail="Failed to fetch MDM from BBPS API")
+
+#         # Parse response
+#         root = ET.fromstring(response)
+#         response_code = root.find("responseCode")
+
+#         if response_code is None or response_code.text != "000":
+#             error_msg = "Invalid response from BBPS API"
+#             if response_code is not None:
+#                 error_msg = f"BBPS API returned code: {response_code.text}"
+#             raise HTTPException(status_code=400, detail=error_msg)
+
+#         # Extract all billers
+#         billers_data = root.findall("biller")
+#         results = []
+#         stored_ids = []
+
+#         for biller_element in billers_data:
+#             blr_id = biller_element.find("billerId").text
+#             category = biller_element.find("billerCategory").text
+#             mdm_xml = ET.tostring(biller_element, encoding='utf-8').decode('utf-8')
+
+#             # Store in database if requested
+#             if store_in_db:
+#                 await _store_mdm_async(db, blr_id, category, mdm_xml)
+#                 stored_ids.append(blr_id)
+
+#             results.append({
+#                 "biller_id": blr_id,
+#                 "category": category,
+#                 "status": "success"
+#             })
+
+#         # Bulk cache invalidation
+#         if stored_ids:
+#             for blr_id in stored_ids:
+#                 await cache.delete(f"biller_mdm:{blr_id}")
+
+#         return {
+#             "success": True,
+#             "total_requested": len(request.biller_ids),
+#             "total_fetched": len(results),
+#             "stored_in_db": len(stored_ids) if store_in_db else 0,
+#             "results": results
+#         }
+
+#     except BBPSException as e:
+#         raise HTTPException(status_code=e.status_code, detail=e.message)
+#     except HTTPException:
+#         raise
+#     except Exception as e:
+#         logger.error(f"Error fetching MDM for multiple billers: {e}", exc_info=True)
+#         raise HTTPException(status_code=500, detail=str(e))
+
+
+# @router.post("/fetch/by-category")
+# async def fetch_mdm_by_category(
+#     request: CategoryMDMRequest,
+#     db: AsyncSession = Depends(get_db),
+#     store_in_db: bool = True,
+#     batch_size: int = Query(50, ge=10, le=100),
+# ):
+#     """
+#     Fetch MDM for all billers in a category (async optimized with batching).
+
+#     Performance:
+#     - Async database query for billers
+#     - Batched async HTTP requests
+#     - Parallel processing where possible
+#     """
+#     logger.info(f"Fetching MDM for category: {request.category}")
+#     try:
+#         # Async get all billers in category
+#         query = select(Biller.blr_id).where(Biller.blr_category_name == request.category)
+#         result = await db.execute(query)
+#         biller_ids = [row[0] for row in result.all()]
+
+#         if not biller_ids:
+#             raise HTTPException(status_code=404, detail=f"No billers found for category: {request.category}")
+
+#         total_billers = len(biller_ids)
+#         total_stored = 0
+#         all_results = []
+#         failed_billers = []
+
+#         # Process in batches
+#         for i in range(0, total_billers, batch_size):
+#             batch = biller_ids[i:i + batch_size]
+#             batch_num = i // batch_size + 1
+#             logger.info(f"Processing batch {batch_num}: {len(batch)} billers")
+
+#             try:
+#                 response = await async_bbps_api_service.get_biller_mdm(batch)
+
+#                 if response:
+#                     root = ET.fromstring(response)
+#                     response_code = root.find("responseCode")
+
+#                     if response_code is not None and response_code.text == "000":
+#                         billers_data = root.findall("biller")
+
+#                         for biller_element in billers_data:
+#                             blr_id = biller_element.find("billerId").text
+#                             category = biller_element.find("billerCategory").text
+#                             mdm_xml = ET.tostring(biller_element, encoding='utf-8').decode('utf-8')
+
+#                             if store_in_db:
+#                                 await _store_mdm_async(db, blr_id, category, mdm_xml)
+#                                 total_stored += 1
+
+#                             all_results.append({
+#                                 "biller_id": blr_id,
+#                                 "category": category,
+#                                 "status": "success"
+#                             })
+#                     else:
+#                         failed_billers.extend(batch)
+#                 else:
+#                     failed_billers.extend(batch)
+
+#             except Exception as e:
+#                 logger.error(f"Error processing batch {batch_num}: {e}")
+#                 failed_billers.extend(batch)
+
+#         return {
+#             "success": True,
+#             "category": request.category,
+#             "total_billers": total_billers,
+#             "total_fetched": len(all_results),
+#             "stored_in_db": total_stored if store_in_db else 0,
+#             "failed_count": len(failed_billers),
+#             "results": all_results
+#         }
+
+#     except HTTPException:
+#         raise
+#     except Exception as e:
+#         logger.error(f"Error fetching MDM by category: {e}", exc_info=True)
+#         raise HTTPException(status_code=500, detail=str(e))
+
+
+# @router.post("/fetch/from-excel")
+# async def fetch_mdm_from_excel(
+#     file: UploadFile = File(...),
+#     db: AsyncSession = Depends(get_db),
+#     store_in_db: bool = True,
+#     batch_size: int = Query(50, ge=10, le=100),
+#     biller_id_column: str = Query("blr_id"),
+# ):
+#     """
+#     Fetch MDM for all billers from Excel file (async optimized).
+
+#     Performance:
+#     - Async file reading
+#     - Batched async HTTP requests
+#     - Progress tracking
+#     """
+#     import pandas as pd
+
+#     logger.info(f"Fetching MDM from Excel file: {file.filename}")
+
+#     if not file.filename.endswith(('.xlsx', '.xls')):
+#         raise HTTPException(status_code=400, detail="File must be an Excel file (.xlsx or .xls)")
+
+#     try:
+#         # Read Excel file
+#         contents = await file.read()
+#         df = pd.read_excel(BytesIO(contents))
+
+#         if biller_id_column not in df.columns:
+#             raise HTTPException(
+#                 status_code=400,
+#                 detail=f"Column '{biller_id_column}' not found. Available: {list(df.columns)}"
+#             )
+
+#         biller_ids = df[biller_id_column].dropna().astype(str).tolist()
+#         total_billers = len(biller_ids)
+
+#         if total_billers == 0:
+#             raise HTTPException(status_code=400, detail="No biller IDs found in Excel file")
+
+#         total_stored = 0
+#         total_fetched = 0
+#         failed_billers = []
+
+#         # Process in batches
+#         for i in range(0, total_billers, batch_size):
+#             batch = biller_ids[i:i + batch_size]
+#             batch_num = i // batch_size + 1
+#             logger.info(f"Processing batch {batch_num}/{(total_billers + batch_size - 1) // batch_size}")
+
+#             try:
+#                 response = await async_bbps_api_service.get_biller_mdm(batch)
+
+#                 if response:
+#                     root = ET.fromstring(response)
+#                     response_code = root.find("responseCode")
+
+#                     if response_code is not None and response_code.text == "000":
+#                         billers_data = root.findall("biller")
+
+#                         for biller_element in billers_data:
+#                             blr_id = biller_element.find("billerId").text
+#                             category = biller_element.find("billerCategory").text
+#                             mdm_xml = ET.tostring(biller_element, encoding='utf-8').decode('utf-8')
+
+#                             if store_in_db:
+#                                 await _store_mdm_async(db, blr_id, category, mdm_xml)
+#                                 total_stored += 1
+
+#                             total_fetched += 1
+#                     else:
+#                         failed_billers.extend(batch)
+#                 else:
+#                     failed_billers.extend(batch)
+
+#             except Exception as e:
+#                 logger.error(f"Error processing batch {batch_num}: {e}")
+#                 failed_billers.extend(batch)
+
+#         return {
+#             "success": True,
+#             "filename": file.filename,
+#             "total_billers_in_file": total_billers,
+#             "total_fetched": total_fetched,
+#             "stored_in_db": total_stored if store_in_db else 0,
+#             "failed_count": len(failed_billers),
+#             "failed_billers": failed_billers[:50] if failed_billers else []
+#         }
+
+#     except HTTPException:
+#         raise
+#     except Exception as e:
+#         logger.error(f"Error processing Excel file: {e}", exc_info=True)
+#         raise HTTPException(status_code=500, detail=str(e))
+
+
+# @router.get("/stored/{biller_id}")
+# @cached(key_prefix="mdm_stored", expire=3600)
+# async def get_stored_mdm(
+#     biller_id: str,
+#     db: AsyncSession = Depends(get_db),
+# ):
+#     """
+#     Get stored MDM for a biller (async with caching).
+
+#     Performance:
+#     - Cached for 1 hour
+#     - Index lookup on blr_id
+#     """
+#     logger.info(f"Getting stored MDM for biller: {biller_id}")
+#     try:
+#         query = select(BillerMDM).where(BillerMDM.blr_id == biller_id)
+#         result = await db.execute(query)
+#         mdm_entry = result.scalar_one_or_none()
+
+#         if not mdm_entry:
+#             raise HTTPException(status_code=404, detail=f"MDM not found for biller: {biller_id}")
+
+#         return {
+#             "success": True,
+#             "biller_id": mdm_entry.blr_id,
+#             "category": mdm_entry.category,
+#             "data": xml_to_dict(parse_xml(mdm_entry.mdm_xml)),
+#             "created_at": mdm_entry.created_at.isoformat() if mdm_entry.created_at else None,
+#             "updated_at": mdm_entry.updated_at.isoformat() if mdm_entry.updated_at else None
+#         }
+
+#     except HTTPException:
+#         raise
+#     except Exception as e:
+#         logger.error(f"Error getting stored MDM: {e}", exc_info=True)
+#         raise HTTPException(status_code=500, detail=str(e))
+
+
+# @router.get("/stored/by-category/{category}")
+# @cached(key_prefix="mdm_by_category", expire=300)
+# async def get_stored_mdm_by_category(
+#     category: str,
+#     skip: int = Query(0, ge=0),
+#     limit: int = Query(100, ge=1, le=500),
+#     db: AsyncSession = Depends(get_db),
+# ):
+#     """
+#     Get stored MDM entries for a category (async with pagination).
+
+#     Performance:
+#     - Cached for 5 minutes
+#     - Uses index on category
+#     - Optimized pagination
+#     """
+#     logger.info(f"Getting stored MDM for category: {category}")
+#     try:
+#         # Count query
+#         count_query = select(func.count(BillerMDM.id)).where(BillerMDM.category == category)
+#         count_result = await db.execute(count_query)
+#         total = count_result.scalar()
+
+#         # Data query with pagination
+#         query = (
+#             select(BillerMDM)
+#             .where(BillerMDM.category == category)
+#             .order_by(BillerMDM.blr_id)
+#             .offset(skip)
+#             .limit(limit)
+#         )
+#         result = await db.execute(query)
+#         mdm_entries = result.scalars().all()
+
+#         return {
+#             "success": True,
+#             "category": category,
+#             "total": total,
+#             "skip": skip,
+#             "limit": limit,
+#             "data": [
+#                 {
+#                     "biller_id": entry.blr_id,
+#                     "category": entry.category,
+#                     "updated_at": entry.updated_at.isoformat() if entry.updated_at else None
+#                 }
+#                 for entry in mdm_entries
+#             ]
+#         }
+
+#     except Exception as e:
+#         logger.error(f"Error getting stored MDM by category: {e}", exc_info=True)
+#         raise HTTPException(status_code=500, detail=str(e))
+
+
+# @router.get("/stats")
+# @cached(key_prefix="mdm_stats", expire=300)
+# async def get_mdm_stats(db: AsyncSession = Depends(get_db)):
+#     """
+#     Get MDM statistics (async with aggregations).
+
+#     Performance:
+#     - Cached for 5 minutes
+#     - Uses optimized COUNT queries
+#     """
+#     logger.info("Getting MDM statistics")
+
+#     # Total MDM entries
+#     total_query = select(func.count(BillerMDM.id))
+#     total_result = await db.execute(total_query)
+#     total = total_result.scalar()
+
+#     # MDM by category
+#     category_query = (
+#         select(BillerMDM.category, func.count(BillerMDM.id).label("count"))
+#         .group_by(BillerMDM.category)
+#         .order_by(func.count(BillerMDM.id).desc())
+#     )
+#     category_result = await db.execute(category_query)
+#     categories = category_result.all()
+
+#     return {
+#         "total_mdm_entries": total,
+#         "by_category": [
+#             {"category": cat, "count": count}
+#             for cat, count in categories
+#         ]
+#     }
+
+
+# async def _store_mdm_async(
+#     db: AsyncSession,
+#     blr_id: str,
+#     category: str,
+#     mdm_xml: str
+# ) -> None:
+#     """Store or update MDM data in database (async optimized)."""
+#     try:
+#         # Check if exists
+#         query = select(BillerMDM).where(BillerMDM.blr_id == blr_id)
+#         result = await db.execute(query)
+#         mdm_entry = result.scalar_one_or_none()
+
+#         if mdm_entry:
+#             mdm_entry.category = category
+#             mdm_entry.mdm_xml = mdm_xml
+#         else:
+#             mdm_entry = BillerMDM(
+#                 blr_id=blr_id,
+#                 category=category,
+#                 mdm_xml=mdm_xml
+#             )
+#             db.add(mdm_entry)
+
+#         await db.commit()
+#         logger.debug(f"MDM stored for biller: {blr_id}")
+
+#         # Also store biller configuration
+#         biller_element = ET.fromstring(mdm_xml)
+#         await _store_biller_configuration_async(db, biller_element)
+
+#     except Exception as e:
+#         print("came to exception", str(e))
+#         await db.rollback()
+#         logger.error(f"Error storing MDM for biller {blr_id}: {e}")
+#         raise
+
+
+# def _parse_biller_configuration(biller_element: ET.Element) -> dict:
+#     """
+#     Parse biller configuration from MDM XML element.
+#     Extracts all fields as per BBPS API Integration Document pages 13-16.
+#     """
+#     def get_text(elem, tag, default=None):
+#         """Get text from child element."""
+#         child = elem.find(tag)
+#         return child.text if child is not None and child.text else default
+
+#     def get_bool(elem, tag):
+#         """Get boolean from child element."""
+#         text = get_text(elem, tag)
+#         if text is None:
+#             return None
+#         return text.lower() in ('true', 'yes', '1')
+
+#     def get_int(elem, tag):
+#         """Get integer from child element."""
+#         text = get_text(elem, tag)
+#         if text is None:
+#             return None
+#         try:
+#             return int(text)
+#         except ValueError:
+#             return None
+
+#     def get_decimal(text):
+#         """Get decimal from text."""
+#         if text is None:
+#             return None
+#         try:
+#             return float(text)
+#         except ValueError:
+#             return None
+
+#     # Parse basic biller info
+#     config = {
+#         'biller_id': get_text(biller_element, 'billerId'),
+#         'biller_name': get_text(biller_element, 'billerName'),
+#         'biller_category': get_text(biller_element, 'billerCategory'),
+#         'biller_adhoc': get_bool(biller_element, 'billerAdhoc'),
+#         'biller_coverage': get_text(biller_element, 'billerCoverage'),
+#         'biller_description': get_text(biller_element, 'billerDescription'),
+#         'biller_fetch_requirement': get_text(biller_element, 'billerFetchRequiremet'),
+#         'biller_payment_exactness': get_text(biller_element, 'billerPaymentExactness'),
+#         'biller_support_bill_validation': get_text(biller_element, 'billerSupportBillValidation'),
+#         'support_pending_status': get_bool(biller_element, 'supportPendingStatus'),
+#         'support_deemed': get_bool(biller_element, 'supportDeemed'),
+#         'biller_timeout': get_int(biller_element, 'billerTimeout'),
+#         'biller_amount_options': get_text(biller_element, 'billerAmountOptions'),
+#         'recharge_amount_in_validation_request': get_text(biller_element, 'rechargeAmountInValidationRequest'),
+#         'plan_mdm_requirement': get_text(biller_element, 'planMdmRequirement'),
+#     }
+
+#     # Parse billerAdditionalInfo
+#     additional_info_elem = biller_element.find('billerAdditionalInfo')
+#     if additional_info_elem is not None:
+#         config['biller_additional_info'] = xml_to_dict(additional_info_elem)
+
+#     # Parse billerAdditionalInfoPayment
+#     additional_info_payment_elem = biller_element.find('billerAdditionalInfoPayment')
+#     if additional_info_payment_elem is not None:
+#         config['biller_additional_info_payment'] = xml_to_dict(additional_info_payment_elem)
+
+#     # Parse planAdditionalInfo
+#     plan_additional_info_elem = biller_element.find('planAdditionalInfo')
+#     if plan_additional_info_elem is not None:
+#         config['plan_additional_info'] = xml_to_dict(plan_additional_info_elem)
+
+#     # Parse billerInputParams
+#     input_params = []
+#     input_params_elem = biller_element.find('billerInputParams')
+#     print("input_params_elem====>", input_params_elem)
+#     if input_params_elem is not None:
+#         for param_elem in input_params_elem.findall('billerInputParam'):
+#             param = {
+#                 'param_name': get_text(param_elem, 'paramName'),
+#                 'data_type': get_text(param_elem, 'dataType'),
+#                 'is_optional': get_bool(param_elem, 'isOptional'),
+#                 'min_length': get_int(param_elem, 'minLength'),
+#                 'max_length': get_int(param_elem, 'maxLength'),
+#                 'regex': get_text(param_elem, 'regEx'),
+#                 'visibility': get_text(param_elem, 'visibility'),
+#             }
+#             # Parse values list
+#             values_elem = param_elem.find('values')
+#             if values_elem is not None:
+#                 values = []
+#                 for value_elem in values_elem.findall('value'):
+#                     if value_elem.text:
+#                         values.append(value_elem.text)
+#                 param['param_values'] = values if values else None
+#             input_params.append(param)
+#     config['input_params'] = input_params
+
+#     # Parse billerPaymentChannels
+#     payment_channels = []
+#     payment_channels_elem = biller_element.find('billerPaymentChannels')
+#     if payment_channels_elem is not None:
+#         for channel_elem in payment_channels_elem.findall('billerPaymentChannel'):
+#             channel = {
+#                 'payment_channel_name': get_text(channel_elem, 'paymentChannelName'),
+#                 'min_amount': get_decimal(get_text(channel_elem, 'minAmount')),
+#                 'max_amount': get_decimal(get_text(channel_elem, 'maxAmount')),
+#             }
+#             payment_channels.append(channel)
+#     config['payment_channels'] = payment_channels
+
+#     # Parse billerPaymentModes
+#     payment_modes = []
+#     payment_modes_elem = biller_element.find('billerPaymentModes')
+#     if payment_modes_elem is not None:
+#         for mode_elem in payment_modes_elem.findall('billerPaymentMode'):
+#             mode = {
+#                 'payment_mode': get_text(mode_elem, 'paymentMode'),
+#                 'min_amount': get_decimal(get_text(mode_elem, 'minAmount')),
+#                 'max_amount': get_decimal(get_text(mode_elem, 'maxAmount')),
+#             }
+#             payment_modes.append(mode)
+#     config['payment_modes'] = payment_modes
+
+#     return config
+
+
+# async def _store_biller_configuration_async(
+#     db: AsyncSession,
+#     biller_element: ET.Element
+# ) -> None:
+#     """Store or update biller configuration from MDM XML element."""
+#     try:
+#         # Parse configuration from XML
+#         config = _parse_biller_configuration(biller_element)
+#         biller_id = config.get('biller_id')
+
+#         if not biller_id:
+#             logger.warning("No biller_id found in MDM XML, skipping configuration storage")
+#             return
+
+#         # Check if exists
+#         query = select(BillerConfiguration).where(BillerConfiguration.biller_id == biller_id)
+#         result = await db.execute(query)
+#         config_entry = result.scalar_one_or_none()
+#         print("came to store=====>")
+#         if config_entry:
+#             # Update existing configuration
+#             config_entry.biller_name = config.get('biller_name')
+#             config_entry.biller_category = config.get('biller_category')
+#             config_entry.biller_adhoc = config.get('biller_adhoc')
+#             config_entry.biller_coverage = config.get('biller_coverage')
+#             config_entry.biller_description = config.get('biller_description')
+#             config_entry.biller_fetch_requirement = config.get('biller_fetch_requirement')
+#             config_entry.biller_payment_exactness = config.get('biller_payment_exactness')
+#             config_entry.biller_support_bill_validation = config.get('biller_support_bill_validation')
+#             config_entry.support_pending_status = config.get('support_pending_status')
+#             config_entry.support_deemed = config.get('support_deemed')
+#             config_entry.biller_timeout = config.get('biller_timeout')
+#             config_entry.biller_amount_options = config.get('biller_amount_options')
+#             config_entry.recharge_amount_in_validation_request = config.get('recharge_amount_in_validation_request')
+#             config_entry.plan_mdm_requirement = config.get('plan_mdm_requirement')
+#             config_entry.biller_additional_info = config.get('biller_additional_info')
+#             config_entry.biller_additional_info_payment = config.get('biller_additional_info_payment')
+#             config_entry.plan_additional_info = config.get('plan_additional_info')
+
+#             # Delete existing related records
+#             await db.execute(delete(BillerInputParam).where(BillerInputParam.biller_id == biller_id))
+#             await db.execute(delete(BillerPaymentChannel).where(BillerPaymentChannel.biller_id == biller_id))
+#             await db.execute(delete(BillerPaymentMode).where(BillerPaymentMode.biller_id == biller_id))
+#             await db.flush()
+#         else:
+#             # Create new configuration
+#             config_entry = BillerConfiguration(
+#                 biller_id=biller_id,
+#                 biller_name=config.get('biller_name'),
+#                 biller_category=config.get('biller_category'),
+#                 biller_adhoc=config.get('biller_adhoc'),
+#                 biller_coverage=config.get('biller_coverage'),
+#                 biller_description=config.get('biller_description'),
+#                 biller_fetch_requirement=config.get('biller_fetch_requirement'),
+#                 biller_payment_exactness=config.get('biller_payment_exactness'),
+#                 biller_support_bill_validation=config.get('biller_support_bill_validation'),
+#                 support_pending_status=config.get('support_pending_status'),
+#                 support_deemed=config.get('support_deemed'),
+#                 biller_timeout=config.get('biller_timeout'),
+#                 biller_amount_options=config.get('biller_amount_options'),
+#                 recharge_amount_in_validation_request=config.get('recharge_amount_in_validation_request'),
+#                 plan_mdm_requirement=config.get('plan_mdm_requirement'),
+#                 biller_additional_info=config.get('biller_additional_info'),
+#                 biller_additional_info_payment=config.get('biller_additional_info_payment'),
+#                 plan_additional_info=config.get('plan_additional_info'),
+#             )
+            
+#             print("store new config entry")
+#             db.add(config_entry)
+#             await db.flush()
+
+#         # Add input params
+#         for param in config.get('input_params', []):
+#             if param.get('param_name'):
+#                 param_entry = BillerInputParam(
+#                     biller_id=biller_id,
+#                     param_name=param.get('param_name'),
+#                     data_type=param.get('data_type'),
+#                     is_optional=param.get('is_optional'),
+#                     min_length=param.get('min_length'),
+#                     max_length=param.get('max_length'),
+#                     regex=param.get('regex'),
+#                     visibility=param.get('visibility'),
+#                     param_values=param.get('param_values'),
+#                 )
+#                 db.add(param_entry)
+
+#         # Add payment channels
+#         for channel in config.get('payment_channels', []):
+#             if channel.get('payment_channel_name'):
+#                 channel_entry = BillerPaymentChannel(
+#                     biller_id=biller_id,
+#                     payment_channel_name=channel.get('payment_channel_name'),
+#                     min_amount=channel.get('min_amount'),
+#                     max_amount=channel.get('max_amount'),
+#                 )
+#                 db.add(channel_entry)
+
+#         # Add payment modes
+#         for mode in config.get('payment_modes', []):
+#             if mode.get('payment_mode'):
+#                 mode_entry = BillerPaymentMode(
+#                     biller_id=biller_id,
+#                     payment_mode=mode.get('payment_mode'),
+#                     min_amount=mode.get('min_amount'),
+#                     max_amount=mode.get('max_amount'),
+#                 )
+#                 db.add(mode_entry)
+
+#         await db.commit()
+#         logger.debug(f"Biller configuration stored for biller: {biller_id}")
+
+#     except Exception as e:
+        
+#         print("came to exception in biller config", str(e))
+#         await db.rollback()
+#         logger.error(f"Error storing biller configuration: {e}")
+#         raise
+
+
+# @router.get("/configuration/{biller_id}")
+# async def get_biller_configuration(
+#     biller_id: str,
+#     db: AsyncSession = Depends(get_db),
+# ):
+#     """
+#     Get stored biller configuration with all related data.
+#     Returns input params, payment channels, and payment modes.
+#     """
+#     logger.info(f"Getting biller configuration for: {biller_id}")
+#     try:
+#         # Get configuration
+#         query = select(BillerConfiguration).where(BillerConfiguration.biller_id == biller_id)
+#         result = await db.execute(query)
+#         config = result.scalar_one_or_none()
+
+#         if not config:
+#             raise HTTPException(status_code=404, detail=f"Configuration not found for biller: {biller_id}")
+
+#         # Get input params
+#         params_query = select(BillerInputParam).where(BillerInputParam.biller_id == biller_id)
+#         params_result = await db.execute(params_query)
+#         input_params = params_result.scalars().all()
+
+#         # Get payment channels
+#         channels_query = select(BillerPaymentChannel).where(BillerPaymentChannel.biller_id == biller_id)
+#         channels_result = await db.execute(channels_query)
+#         payment_channels = channels_result.scalars().all()
+
+#         # Get payment modes
+#         modes_query = select(BillerPaymentMode).where(BillerPaymentMode.biller_id == biller_id)
+#         modes_result = await db.execute(modes_query)
+#         payment_modes = modes_result.scalars().all()
+
+#         return {
+#             "success": True,
+#             "biller_id": config.biller_id,
+#             "configuration": {
+#                 "biller_name": config.biller_name,
+#                 "biller_category": config.biller_category,
+#                 "biller_adhoc": config.biller_adhoc,
+#                 "biller_coverage": config.biller_coverage,
+#                 "biller_description": config.biller_description,
+#                 "biller_fetch_requirement": config.biller_fetch_requirement,
+#                 "biller_payment_exactness": config.biller_payment_exactness,
+#                 "biller_support_bill_validation": config.biller_support_bill_validation,
+#                 "support_pending_status": config.support_pending_status,
+#                 "support_deemed": config.support_deemed,
+#                 "biller_timeout": config.biller_timeout,
+#                 "biller_amount_options": config.biller_amount_options,
+#                 "recharge_amount_in_validation_request": config.recharge_amount_in_validation_request,
+#                 "plan_mdm_requirement": config.plan_mdm_requirement,
+#                 "biller_additional_info": config.biller_additional_info,
+#                 "biller_additional_info_payment": config.biller_additional_info_payment,
+#                 "plan_additional_info": config.plan_additional_info,
+#                 "created_at": config.created_at.isoformat() if config.created_at else None,
+#                 "updated_at": config.updated_at.isoformat() if config.updated_at else None,
+#             },
+#             "input_params": [
+#                 {
+#                     "param_name": p.param_name,
+#                     "data_type": p.data_type,
+#                     "is_optional": p.is_optional,
+#                     "min_length": p.min_length,
+#                     "max_length": p.max_length,
+#                     "regex": p.regex,
+#                     "visibility": p.visibility,
+#                     "param_values": p.param_values,
+#                 }
+#                 for p in input_params
+#             ],
+#             "payment_channels": [
+#                 {
+#                     "payment_channel_name": c.payment_channel_name,
+#                     "min_amount": float(c.min_amount) if c.min_amount else None,
+#                     "max_amount": float(c.max_amount) if c.max_amount else None,
+#                 }
+#                 for c in payment_channels
+#             ],
+#             "payment_modes": [
+#                 {
+#                     "payment_mode": m.payment_mode,
+#                     "min_amount": float(m.min_amount) if m.min_amount else None,
+#                     "max_amount": float(m.max_amount) if m.max_amount else None,
+#                 }
+#                 for m in payment_modes
+#             ],
+#         }
+
+#     except HTTPException:
+#         raise
+#     except Exception as e:
+#         logger.error(f"Error getting biller configuration: {e}", exc_info=True)
+#         raise HTTPException(status_code=500, detail=str(e))
+
+
+# @router.get("/configurations")
+# async def list_biller_configurations(
+#     category: Optional[str] = None,
+#     skip: int = Query(0, ge=0),
+#     limit: int = Query(100, ge=1, le=500),
+#     db: AsyncSession = Depends(get_db),
+# ):
+#     """
+#     List all stored biller configurations with pagination.
+#     Optionally filter by category.
+#     """
+#     logger.info(f"Listing biller configurations, category={category}, skip={skip}, limit={limit}")
+#     try:
+#         # Build query
+#         query = select(BillerConfiguration)
+#         count_query = select(func.count(BillerConfiguration.id))
+
+#         if category:
+#             query = query.where(BillerConfiguration.biller_category == category)
+#             count_query = count_query.where(BillerConfiguration.biller_category == category)
+
+#         # Get total count
+#         count_result = await db.execute(count_query)
+#         total = count_result.scalar()
+
+#         # Get configurations
+#         query = query.order_by(BillerConfiguration.biller_id).offset(skip).limit(limit)
+#         result = await db.execute(query)
+#         configurations = result.scalars().all()
+
+#         return {
+#             "success": True,
+#             "total": total,
+#             "skip": skip,
+#             "limit": limit,
+#             "category_filter": category,
+#             "data": [
+#                 {
+#                     "biller_id": c.biller_id,
+#                     "biller_name": c.biller_name,
+#                     "biller_category": c.biller_category,
+#                     "biller_coverage": c.biller_coverage,
+#                     "biller_fetch_requirement": c.biller_fetch_requirement,
+#                     "biller_adhoc": c.biller_adhoc,
+#                     "updated_at": c.updated_at.isoformat() if c.updated_at else None,
+#                 }
+#                 for c in configurations
+#             ],
+#         }
+
+#     except Exception as e:
+#         logger.error(f"Error listing biller configurations: {e}", exc_info=True)
+#         raise HTTPException(status_code=500, detail=str(e))
+
+
